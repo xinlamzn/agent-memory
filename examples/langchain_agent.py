@@ -7,9 +7,10 @@ This example shows how to use Neo4j Agent Memory with LangChain:
 - Using Neo4jMemoryRetriever for RAG
 
 Requirements:
-    - Neo4j running (or set NEO4J_URI in .env)
-    - pip install neo4j-agent-memory[langchain,openai]
-    - OPENAI_API_KEY environment variable set (or in .env)
+    - Memory Store (OpenSearch) running at localhost:9200
+      (or set MEMORY_STORE_ENDPOINT in .env)
+    - pip install neo4j-agent-memory[langchain,bedrock]
+    - AWS credentials configured (for Bedrock Titan embeddings)
 
 Environment variables can be set in examples/.env file.
 """
@@ -17,9 +18,6 @@ Environment variables can be set in examples/.env file.
 import asyncio
 import os
 from pathlib import Path
-
-from pydantic import SecretStr
-
 
 def load_env_files():
     """Load environment variables from .env files."""
@@ -51,15 +49,27 @@ def load_env_files():
 
 load_env_files()
 
-from neo4j_agent_memory import MemoryClient, MemorySettings, Neo4jConfig
+from neo4j_agent_memory import (
+    EmbeddingConfig,
+    EmbeddingProvider,
+    MemoryClient,
+    MemorySettings,
+    MemoryStoreConfig,
+)
 
 
 async def main():
     settings = MemorySettings(
-        neo4j=Neo4jConfig(
-            uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-            password=SecretStr(os.getenv("NEO4J_PASSWORD", "password")),
-        )
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=os.getenv("MEMORY_STORE_ENDPOINT", "https://localhost:9200"),
+        ),
+        embedding=EmbeddingConfig(
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=os.getenv("AWS_REGION", "us-west-2"),
+        ),
     )
 
     async with MemoryClient(settings) as client:

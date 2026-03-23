@@ -42,6 +42,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from neo4j_agent_memory.config.memory_store_settings import MemoryStoreConfig
 from neo4j_agent_memory.config.settings import (
     EmbeddingConfig,
     EmbeddingProvider,
@@ -197,6 +198,7 @@ __all__ = [
     # Settings
     "MemorySettings",
     "Neo4jConfig",
+    "MemoryStoreConfig",
     "EmbeddingConfig",
     "LLMConfig",
     "ExtractionConfig",

@@ -252,10 +252,10 @@ async def demo_caching_and_composite():
         )
 
 
-async def demo_with_neo4j():
-    """Demonstrate full integration with Neo4j and background enrichment."""
+async def demo_with_memory_store():
+    """Demonstrate full integration with Memory Store and background enrichment."""
     print("\n" + "=" * 60)
-    print("DEMO 4: Full Integration with Neo4j")
+    print("DEMO 4: Full Integration with Memory Store")
     print("=" * 60)
 
     # Check for required dependencies
@@ -265,54 +265,35 @@ async def demo_with_neo4j():
         print("\nERROR: httpx is required for enrichment providers")
         return
 
-    neo4j_uri = os.getenv("NEO4J_URI")
-    neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
+    memory_store_endpoint = os.getenv("MEMORY_STORE_ENDPOINT")
 
-    if not neo4j_uri:
-        print("\nSkipping Neo4j demo - NEO4J_URI not set")
-        print("Set NEO4J_URI and NEO4J_PASSWORD to enable this demo")
-        print("Example: NEO4J_URI=bolt://localhost:7687")
+    if not memory_store_endpoint:
+        print("\nSkipping Memory Store demo - MEMORY_STORE_ENDPOINT not set")
+        print("Set MEMORY_STORE_ENDPOINT to enable this demo")
+        print("Example: MEMORY_STORE_ENDPOINT=https://localhost:9200")
         return
-
-    from pydantic import SecretStr
 
     from neo4j_agent_memory import (
         EmbeddingConfig,
         EmbeddingProvider,
         MemoryClient,
         MemorySettings,
-        Neo4jConfig,
+        MemoryStoreConfig,
     )
     from neo4j_agent_memory.config.settings import EnrichmentConfig, EnrichmentProvider
 
-    # Check for OpenAI API key
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if openai_api_key:
-        embedding_config = EmbeddingConfig(
-            provider=EmbeddingProvider.OPENAI,
-            model="text-embedding-3-small",
-        )
-    else:
-        try:
-            import sentence_transformers  # noqa: F401
-
-            embedding_config = EmbeddingConfig(
-                provider=EmbeddingProvider.SENTENCE_TRANSFORMERS,
-                model="all-MiniLM-L6-v2",
-                dimensions=384,
-            )
-        except ImportError:
-            print("\nERROR: Need either OPENAI_API_KEY or sentence-transformers")
-            return
-
     # Configure settings with enrichment enabled
     settings = MemorySettings(
-        neo4j=Neo4jConfig(
-            uri=neo4j_uri,
-            username=os.getenv("NEO4J_USERNAME", "neo4j"),
-            password=SecretStr(neo4j_password),
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=memory_store_endpoint,
         ),
-        embedding=embedding_config,
+        embedding=EmbeddingConfig(
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=os.getenv("AWS_REGION", "us-west-2"),
+        ),
         enrichment=EnrichmentConfig(
             enabled=True,
             providers=[EnrichmentProvider.WIKIMEDIA],
@@ -323,7 +304,7 @@ async def demo_with_neo4j():
         ),
     )
 
-    print("\nConnecting to Neo4j with enrichment enabled...")
+    print("\nConnecting to Memory Store with enrichment enabled...")
     async with MemoryClient(settings) as client:
         print("Connected!")
 
@@ -374,7 +355,7 @@ async def demo_with_neo4j():
         print("\n" + "-" * 40)
         print("Note: Background enrichment is asynchronous.")
         print("Entities may take a few seconds to be enriched.")
-        print("Check Neo4j for 'enriched_description' property on Entity nodes.")
+        print("Check Memory Store for 'enriched_description' property on Entity nodes.")
 
 
 async def main():
@@ -392,8 +373,8 @@ async def main():
     # Demo 3: Caching and composite providers
     await demo_caching_and_composite()
 
-    # Demo 4: Full Neo4j integration
-    await demo_with_neo4j()
+    # Demo 4: Full Memory Store integration
+    await demo_with_memory_store()
 
     print("\n" + "=" * 60)
     print("Enrichment Examples Complete!")

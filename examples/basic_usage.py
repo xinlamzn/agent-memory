@@ -9,9 +9,10 @@ This example demonstrates the core functionality of the memory system:
 - Getting combined context for LLM prompts
 
 Requirements:
-    - Neo4j running (or set NEO4J_URI in .env)
-    - pip install neo4j-agent-memory[openai]
-    - OPENAI_API_KEY environment variable set (or in .env)
+    - Memory Store (OpenSearch) running at localhost:9200
+      (or set MEMORY_STORE_ENDPOINT in .env)
+    - pip install neo4j-agent-memory[bedrock]
+    - AWS credentials configured (for Bedrock Titan embeddings)
 
 Environment variables can be set in examples/.env file.
 """
@@ -19,9 +20,6 @@ Environment variables can be set in examples/.env file.
 import asyncio
 import os
 from pathlib import Path
-
-from pydantic import SecretStr
-
 
 def load_env_files():
     """Load environment variables from .env files."""
@@ -68,50 +66,13 @@ from neo4j_agent_memory import (
     GeocodingProvider,
     MemoryClient,
     MemorySettings,
+    MemoryStoreConfig,
     MessageRole,
-    Neo4jConfig,
     ToolCallStatus,
 )
 
 
 async def main():
-    # Configure embedding provider based on available API keys
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-
-    if openai_api_key:
-        # Use OpenAI embeddings if API key is available
-        embedding_config = EmbeddingConfig(
-            provider=EmbeddingProvider.OPENAI,
-            model="text-embedding-3-small",
-        )
-        extraction_config = ExtractionConfig(
-            extractor_type=ExtractorType.LLM,
-        )
-        print("Using OpenAI embeddings and LLM extraction")
-    else:
-        # Fall back to sentence-transformers (requires: pip install neo4j-agent-memory[sentence-transformers])
-        try:
-            import sentence_transformers  # noqa: F401
-
-            embedding_config = EmbeddingConfig(
-                provider=EmbeddingProvider.SENTENCE_TRANSFORMERS,
-                model="all-MiniLM-L6-v2",
-                dimensions=384,
-            )
-            extraction_config = ExtractionConfig(
-                extractor_type=ExtractorType.NONE,  # Disable extraction without LLM
-            )
-            print("Using sentence-transformers embeddings (no OPENAI_API_KEY found)")
-            print("Note: Entity extraction disabled without OpenAI API key")
-        except ImportError:
-            print("ERROR: No embedding provider available!")
-            print("Either:")
-            print("  1. Set OPENAI_API_KEY environment variable, or")
-            print(
-                "  2. Install sentence-transformers: pip install neo4j-agent-memory[sentence-transformers]"
-            )
-            return
-
     # Configure geocoding (optional - enable to add coordinates to LOCATION entities)
     # Uses Nominatim (OpenStreetMap) by default - free but rate-limited to 1 req/sec
     # For higher accuracy, use GeocodingProvider.GOOGLE with an API key
@@ -123,15 +84,22 @@ async def main():
 
     # Configure the memory client
     settings = MemorySettings(
-        neo4j=Neo4jConfig(
-            uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-            username=os.getenv("NEO4J_USERNAME", "neo4j"),
-            password=SecretStr(os.getenv("NEO4J_PASSWORD", "password")),
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=os.getenv("MEMORY_STORE_ENDPOINT", "https://localhost:9200"),
         ),
-        embedding=embedding_config,
-        extraction=extraction_config,
+        embedding=EmbeddingConfig(
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=os.getenv("AWS_REGION", "us-west-2"),
+        ),
+        extraction=ExtractionConfig(
+            extractor_type=ExtractorType.LLM,
+        ),
         geocoding=geocoding_config,
     )
+    print("Using Bedrock Titan v2 embeddings + Memory Store backend")
 
     async with MemoryClient(settings) as memory:
         session_id = "demo-session"

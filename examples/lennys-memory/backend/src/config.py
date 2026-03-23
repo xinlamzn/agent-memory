@@ -15,13 +15,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Neo4j Configuration
-    neo4j_uri: str = Field(default="bolt://localhost:7687")
-    neo4j_username: str = Field(default="neo4j")
-    neo4j_password: SecretStr = Field(default=SecretStr("password"))
+    # Memory Store Configuration
+    memory_store_endpoint: str = Field(default="https://localhost:9200")
 
-    # OpenAI Configuration
-    openai_api_key: SecretStr = Field(default=SecretStr(""))
+    # AWS Bedrock Configuration
+    aws_region: str = Field(default="us-west-2")
 
     # Enrichment Configuration
     enrichment_enabled: bool = Field(default=True)  # Enable Wikipedia enrichment

@@ -10,17 +10,14 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Neo4jSettings(BaseSettings):
-    """Neo4j database configuration."""
+class MemoryStoreSettings(BaseSettings):
+    """Memory Store (OpenSearch) configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="NEO4J_")
+    model_config = SettingsConfigDict(env_prefix="MEMORY_STORE_")
 
-    uri: str = Field(
-        default="bolt://localhost:7687", description="Neo4j connection URI"
+    endpoint: str = Field(
+        default="https://localhost:9200", description="Memory Store REST endpoint URL"
     )
-    user: str = Field(default="neo4j", description="Neo4j username")
-    password: str = Field(default="password", description="Neo4j password")
-    database: str = Field(default="neo4j", description="Neo4j database name")
 
 
 class BedrockSettings(BaseSettings):
@@ -36,7 +33,7 @@ class BedrockSettings(BaseSettings):
         default="amazon.titan-embed-text-v2:0",
         description="Bedrock model ID for embeddings",
     )
-    region: str = Field(default="us-east-1", description="AWS region for Bedrock")
+    region: str = Field(default="us-west-2", description="AWS region for Bedrock")
 
 
 class AWSSettings(BaseSettings):
@@ -44,7 +41,7 @@ class AWSSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="AWS_")
 
-    region: str = Field(default="us-east-1", description="AWS region")
+    region: str = Field(default="us-west-2", description="AWS region")
     profile: str | None = Field(default=None, description="AWS profile name")
     access_key_id: str | None = Field(default=None, description="AWS access key ID")
     secret_access_key: str | None = Field(
@@ -70,7 +67,7 @@ class S3Settings(BaseSettings):
         default="financial-advisor-documents",
         description="S3 bucket for document storage",
     )
-    region: str = Field(default="us-east-1", description="S3 bucket region")
+    region: str = Field(default="us-west-2", description="S3 bucket region")
 
 
 class AppSettings(BaseSettings):
@@ -107,7 +104,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    neo4j: Neo4jSettings = Field(default_factory=Neo4jSettings)
+    memory_store: MemoryStoreSettings = Field(default_factory=MemoryStoreSettings)
     bedrock: BedrockSettings = Field(default_factory=BedrockSettings)
     aws: AWSSettings = Field(default_factory=AWSSettings)
     cognito: CognitoSettings = Field(default_factory=CognitoSettings)
@@ -117,10 +114,8 @@ class Settings(BaseSettings):
     def to_strands_config_dict(self) -> dict[str, Any]:
         """Convert settings to Strands integration config format."""
         return {
-            "neo4j_uri": self.neo4j.uri,
-            "neo4j_user": self.neo4j.user,
-            "neo4j_password": self.neo4j.password,
-            "neo4j_database": self.neo4j.database,
+            "backend": "memory_store",
+            "memory_store_endpoint": self.memory_store.endpoint,
             "embedding_provider": "bedrock",
             "embedding_model": self.bedrock.embedding_model_id,
             "aws_region": self.aws.region,
@@ -129,11 +124,9 @@ class Settings(BaseSettings):
     def to_memory_settings_dict(self) -> dict[str, Any]:
         """Convert settings to MemorySettings format."""
         return {
-            "neo4j": {
-                "uri": self.neo4j.uri,
-                "username": self.neo4j.user,
-                "password": self.neo4j.password,
-                "database": self.neo4j.database,
+            "backend": "memory_store",
+            "memory_store": {
+                "endpoint": self.memory_store.endpoint,
             },
             "embedding": {
                 "provider": "bedrock",

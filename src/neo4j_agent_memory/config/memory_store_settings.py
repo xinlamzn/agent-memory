@@ -10,7 +10,7 @@ class MemoryStoreConfig(BaseModel):
     """
 
     endpoint: str = Field(
-        default="http://localhost:9200",
+        default="https://localhost:9200",
         description="Memory Store REST endpoint URL",
     )
     database: str = Field(

@@ -15,19 +15,17 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Neo4j Memory Graph Configuration
-    neo4j_uri: str = Field(default="bolt://localhost:7687")
-    neo4j_username: str = Field(default="neo4j")
-    neo4j_password: SecretStr = Field(default=SecretStr("password"))
+    # Memory Store Configuration
+    memory_store_endpoint: str = Field(default="https://localhost:9200")
+
+    # AWS Bedrock Configuration
+    aws_region: str = Field(default="us-west-2")
 
     # Neo4j News Graph Configuration
     news_graph_uri: str = Field(default="bolt://localhost:7687")
     news_graph_username: str = Field(default="neo4j")
     news_graph_password: SecretStr = Field(default=SecretStr("password"))
     news_graph_database: str = Field(default="neo4j")
-
-    # OpenAI Configuration
-    openai_api_key: SecretStr = Field(default=SecretStr(""))
 
     # Server Configuration
     host: str = Field(default="0.0.0.0")

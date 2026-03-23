@@ -1,13 +1,17 @@
 """Memory configuration for the retail assistant."""
 
 import os
-from typing import Optional
 
 from dotenv import load_dotenv
-from pydantic import SecretStr
 from pydantic_settings import BaseSettings
 
-from neo4j_agent_memory import MemoryClient, MemorySettings
+from neo4j_agent_memory import (
+    EmbeddingConfig,
+    EmbeddingProvider,
+    MemoryClient,
+    MemorySettings,
+    MemoryStoreConfig,
+)
 from neo4j_agent_memory.integrations.microsoft_agent import (
     GDSAlgorithm,
     GDSConfig,
@@ -21,18 +25,11 @@ load_dotenv()
 class Settings(BaseSettings):
     """Application settings."""
 
-    # Neo4j connection
-    neo4j_uri: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    neo4j_user: str = os.getenv("NEO4J_USER", "neo4j")
-    neo4j_password: str = os.getenv("NEO4J_PASSWORD", "password")
+    # Memory Store
+    memory_store_endpoint: str = os.getenv("MEMORY_STORE_ENDPOINT", "https://localhost:9200")
 
-    # OpenAI
-    openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
-
-    # Azure OpenAI (alternative)
-    azure_openai_api_key: Optional[str] = os.getenv("AZURE_OPENAI_API_KEY")
-    azure_openai_endpoint: Optional[str] = os.getenv("AZURE_OPENAI_ENDPOINT")
-    azure_openai_deployment: Optional[str] = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+    # AWS Bedrock
+    aws_region: str = os.getenv("AWS_REGION", "us-west-2")
 
     class Config:
         env_file = ".env"
@@ -45,21 +42,26 @@ settings = Settings()
 def get_memory_settings() -> MemorySettings:
     """Create MemorySettings from environment."""
     return MemorySettings(
-        neo4j={
-            "uri": settings.neo4j_uri,
-            "user": settings.neo4j_user,
-            "password": SecretStr(settings.neo4j_password),
-        },
-        embedding={
-            "provider": "openai",
-            "model": "text-embedding-3-small",
-            "api_key": SecretStr(settings.openai_api_key) if settings.openai_api_key else None,
-        },
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=settings.memory_store_endpoint,
+        ),
+        embedding=EmbeddingConfig(
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=settings.aws_region,
+        ),
     )
 
 
 def get_gds_config() -> GDSConfig:
-    """Create GDS configuration for retail recommendations."""
+    """Create GDS configuration for retail recommendations.
+
+    Note: GDS (Graph Data Science) features require the Neo4j backend.
+    When using backend="memory_store", GDS algorithms will fall back to
+    basic alternatives if fallback_to_basic=True.
+    """
     return GDSConfig(
         enabled=True,
         use_pagerank_for_ranking=True,

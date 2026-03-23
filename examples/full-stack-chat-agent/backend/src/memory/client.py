@@ -2,7 +2,13 @@
 
 import logging
 
-from neo4j_agent_memory import MemoryClient, MemorySettings, Neo4jConfig
+from neo4j_agent_memory import (
+    EmbeddingConfig,
+    EmbeddingProvider,
+    MemoryClient,
+    MemorySettings,
+    MemoryStoreConfig,
+)
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -15,7 +21,7 @@ async def init_memory_client() -> MemoryClient | None:
     """Initialize the memory client singleton.
 
     Returns the client if connected successfully, None otherwise.
-    The app can still run without memory features if Neo4j is unavailable.
+    The app can still run without memory features if Memory Store is unavailable.
     """
     global _memory_client, _memory_connected
 
@@ -25,11 +31,16 @@ async def init_memory_client() -> MemoryClient | None:
     settings = get_settings()
 
     memory_settings = MemorySettings(
-        neo4j=Neo4jConfig(
-            uri=settings.neo4j_uri,
-            username=settings.neo4j_username,
-            password=settings.neo4j_password,
-        )
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=settings.memory_store_endpoint,
+        ),
+        embedding=EmbeddingConfig(
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=settings.aws_region,
+        ),
     )
 
     _memory_client = MemoryClient(memory_settings)
@@ -37,10 +48,10 @@ async def init_memory_client() -> MemoryClient | None:
     try:
         await _memory_client.connect()
         _memory_connected = True
-        logger.info("Successfully connected to Neo4j memory graph")
+        logger.info("Successfully connected to Memory Store")
     except Exception as e:
-        logger.warning(f"Failed to connect to Neo4j memory graph: {e}")
-        logger.warning("Memory features will be disabled. Check your Neo4j configuration.")
+        logger.warning(f"Failed to connect to Memory Store: {e}")
+        logger.warning("Memory features will be disabled. Check your Memory Store configuration.")
         _memory_connected = False
 
     return _memory_client

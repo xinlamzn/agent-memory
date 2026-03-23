@@ -1,20 +1,19 @@
 services:
-  neo4j:
-    image: neo4j:5.26-community
-    container_name: lennys-memory-neo4j
+  opensearch:
+    image: opensearchproject/opensearch:latest
+    container_name: lennys-memory-opensearch
     ports:
-      - "7474:7474"  # HTTP
-      - "7687:7687"  # Bolt
+      - "9200:9200"
     environment:
-      - NEO4J_AUTH=neo4j/password
-      - NEO4J_PLUGINS=["apoc"]
-      - NEO4J_apoc_export_file_enabled=true
-      - NEO4J_apoc_import_file_enabled=true
-      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
     volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
-  neo4j_data:
-  neo4j_logs:
+  opensearch_data:

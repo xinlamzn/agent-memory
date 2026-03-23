@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from neo4j_agent_memory import MemoryClient, MemorySettings
-from neo4j_agent_memory.config import EmbeddingConfig, EmbeddingProvider, Neo4jConfig
+from neo4j_agent_memory.config import EmbeddingConfig, EmbeddingProvider, MemoryStoreConfig
 
 from ..config import get_settings
 
@@ -28,11 +28,9 @@ class FinancialMemoryService:
         """Initialize the memory service."""
         settings = get_settings()
         memory_settings = MemorySettings(
-            neo4j=Neo4jConfig(
-                uri=settings.neo4j.uri,
-                username=settings.neo4j.user,
-                password=settings.neo4j.password,
-                database=settings.neo4j.database,
+            backend="memory_store",
+            memory_store=MemoryStoreConfig(
+                endpoint=settings.memory_store.endpoint,
             ),
             embedding=EmbeddingConfig(
                 provider=EmbeddingProvider.BEDROCK,
