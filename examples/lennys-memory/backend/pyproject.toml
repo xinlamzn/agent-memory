@@ -11,7 +11,7 @@ dependencies = [
     "neo4j>=5.26.0",
     "sse-starlette>=2.2.0",
     "python-dotenv>=1.0.0",
-    "neo4j-agent-memory[extraction,openai]",
+    "neo4j-agent-memory[extraction,bedrock]",
     "spacy>=3.7.0",
     "gliner>=0.2.0",
     "glirel>=0.1.0",
@@ -30,10 +30,10 @@ test = [
 package = true
 
 [tool.uv.sources]
-# For local development, use the editable path:
-# neo4j-agent-memory = { path = "../../..", editable = true }
 # For deployment (Railway/production), use the Git URL:
-neo4j-agent-memory = { git = "https://github.com/neo4j-labs/agent-memory" }
+# neo4j-agent-memory = { git = "https://github.com/neo4j-labs/agent-memory" }
+# For local development, use the editable path:
+neo4j-agent-memory = { path = "../../..", editable = true }
 en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
 
 [build-system]

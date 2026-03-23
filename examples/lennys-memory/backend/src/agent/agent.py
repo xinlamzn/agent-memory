@@ -1,7 +1,7 @@
 """PydanticAI podcast exploration agent."""
 
 import json
-import os
+
 from functools import lru_cache
 
 from pydantic_ai import Agent, RunContext
@@ -45,7 +45,7 @@ from src.agent.tools import (
     search_podcast_content,
     trigger_entity_enrichment,
 )
-from src.config import get_settings
+
 
 SYSTEM_PROMPT = """You are a helpful assistant that has deep knowledge of Lenny's Podcast.
 
@@ -276,13 +276,8 @@ Be conversational and helpful. Share interesting insights from the podcast discu
 @lru_cache
 def get_podcast_agent() -> Agent[AgentDeps, str]:
     """Create and return the podcast agent (cached)."""
-    # Ensure OpenAI API key is set in environment
-    settings = get_settings()
-    if settings.openai_api_key.get_secret_value():
-        os.environ["OPENAI_API_KEY"] = settings.openai_api_key.get_secret_value()
-
     agent = Agent(
-        "openai:gpt-4o",
+        "bedrock:us.anthropic.claude-sonnet-4-20250514-v1:0",
         deps_type=AgentDeps,
         system_prompt=SYSTEM_PROMPT,
     )

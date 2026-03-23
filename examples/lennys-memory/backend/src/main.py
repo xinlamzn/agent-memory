@@ -1,6 +1,5 @@
 """FastAPI application entry point."""
 
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,11 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.routes import chat, memory, threads
 from src.config import get_settings
 from src.memory.client import close_memory_client, init_memory_client, is_memory_connected
-
-# Set OpenAI API key from settings early, before any agent initialization
-_settings = get_settings()
-if _settings.openai_api_key.get_secret_value():
-    os.environ["OPENAI_API_KEY"] = _settings.openai_api_key.get_secret_value()
 
 
 @asynccontextmanager

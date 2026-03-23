@@ -17,6 +17,9 @@ class Settings(BaseSettings):
 
     # Memory Store Configuration
     memory_store_endpoint: str = Field(default="https://localhost:9200")
+    memory_store_username: str | None = Field(default=None)
+    memory_store_password: SecretStr | None = Field(default=None)
+    memory_store_verify_ssl: bool = Field(default=True)
 
     # AWS Bedrock Configuration
     aws_region: str = Field(default="us-west-2")
