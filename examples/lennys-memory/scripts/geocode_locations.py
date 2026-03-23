@@ -77,15 +77,17 @@ async def main():
     from pydantic import SecretStr
 
     from neo4j_agent_memory import (
+        EmbeddingConfig,
+        EmbeddingProvider,
         GeocodingConfig,
         GeocodingProvider,
         MemoryClient,
         MemorySettings,
+        MemoryStoreConfig,
     )
 
-    # Get Neo4j connection settings from environment
-    neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
+    # Get Memory Store connection settings from environment
+    memory_store_endpoint = os.getenv("MEMORY_STORE_ENDPOINT", "https://localhost:9200")
 
     # Configure geocoding - the MemoryClient will automatically create and
     # wire the geocoder to LongTermMemory
@@ -100,15 +102,21 @@ async def main():
     )
 
     settings = MemorySettings(
-        neo4j={
-            "uri": neo4j_uri,
-            "password": SecretStr(neo4j_password),
-        },
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=memory_store_endpoint,
+        ),
+        embedding=EmbeddingConfig(
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=os.getenv("AWS_REGION", "us-west-2"),
+        ),
         geocoding=geocoding_config,
     )
 
     print(f"Geocoding Location entities using {args.provider.title()}")
-    print(f"Neo4j: {neo4j_uri}")
+    print(f"Memory Store: {memory_store_endpoint}")
     print()
 
     async with MemoryClient(settings) as client:

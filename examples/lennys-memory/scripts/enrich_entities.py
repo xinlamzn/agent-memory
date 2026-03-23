@@ -28,8 +28,13 @@ from dotenv import load_dotenv
 # Load .env file from backend directory
 load_dotenv(Path(__file__).parent.parent / "backend" / ".env")
 
-from neo4j_agent_memory import MemoryClient, MemorySettings, Neo4jConfig
-from neo4j_agent_memory.config.settings import EmbeddingConfig
+from neo4j_agent_memory import (
+    EmbeddingConfig,
+    EmbeddingProvider,
+    MemoryClient,
+    MemorySettings,
+    MemoryStoreConfig,
+)
 from neo4j_agent_memory.enrichment.wikimedia import WikimediaProvider
 from neo4j_agent_memory.enrichment.base import EnrichmentStatus
 
@@ -444,17 +449,19 @@ Examples:
     # Get settings from environment
     import os
     settings = MemorySettings(
-        neo4j=Neo4jConfig(
-            uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-            username=os.getenv("NEO4J_USERNAME", "neo4j"),
-            password=os.getenv("NEO4J_PASSWORD", "password"),
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=os.getenv("MEMORY_STORE_ENDPOINT", "https://localhost:9200"),
         ),
         embedding=EmbeddingConfig(
-            api_key=os.getenv("OPENAI_API_KEY"),
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=os.getenv("AWS_REGION", "us-west-2"),
         ),
     )
 
-    print(f"\n{color('Connecting to Neo4j...', Colors.CYAN)}")
+    print(f"\n{color('Connecting to Memory Store...', Colors.CYAN)}")
 
     async with MemoryClient(settings) as client:
         print(f"{color('✓ Connected', Colors.GREEN)}")

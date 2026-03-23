@@ -33,9 +33,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 from dotenv import load_dotenv
-from pydantic import SecretStr
 
-from neo4j_agent_memory import MemoryClient, MemorySettings, Neo4jConfig
+from neo4j_agent_memory import (
+    EmbeddingConfig,
+    EmbeddingProvider,
+    MemoryClient,
+    MemorySettings,
+    MemoryStoreConfig,
+)
 from neo4j_agent_memory.extraction.gliner_extractor import (
     GLiRELExtractor,
     is_glirel_available,
@@ -524,19 +529,14 @@ Examples:
 """,
     )
     parser.add_argument(
-        "--neo4j-uri",
-        default=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-        help="Neo4j connection URI",
+        "--memory-store-endpoint",
+        default=os.getenv("MEMORY_STORE_ENDPOINT", "https://localhost:9200"),
+        help="Memory Store endpoint",
     )
     parser.add_argument(
-        "--neo4j-user",
-        default=os.getenv("NEO4J_USERNAME", "neo4j"),
-        help="Neo4j username",
-    )
-    parser.add_argument(
-        "--neo4j-password",
-        default=os.getenv("NEO4J_PASSWORD", "password"),
-        help="Neo4j password",
+        "--aws-region",
+        default=os.getenv("AWS_REGION", "us-west-2"),
+        help="AWS region for Bedrock embeddings",
     )
     parser.add_argument(
         "--batch-size",
@@ -585,17 +585,22 @@ Examples:
         print("Install it with: pip install glirel")
         sys.exit(1)
 
-    # Connect to Neo4j
+    # Connect to Memory Store
     settings = MemorySettings(
-        neo4j=Neo4jConfig(
-            uri=args.neo4j_uri,
-            username=args.neo4j_user,
-            password=SecretStr(args.neo4j_password),
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=args.memory_store_endpoint,
+        ),
+        embedding=EmbeddingConfig(
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=args.aws_region,
         ),
     )
 
     print()
-    print(color("Connecting to Neo4j...", Colors.DIM), end=" ", flush=True)
+    print(color("Connecting to Memory Store...", Colors.DIM), end=" ", flush=True)
 
     try:
         memory_client = MemoryClient(settings)

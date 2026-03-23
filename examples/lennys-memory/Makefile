@@ -1,4 +1,4 @@
-.PHONY: help install load-sample load-full load-fast load-resume load-dry-run run-backend run-frontend run neo4j clean geocode-locations extract-entities enrich enrich-status backfill-relationships backfill-relationships-status backfill-embeddings backfill-embeddings-status
+.PHONY: help install load-sample load-full load-fast load-resume load-dry-run run-backend run-frontend run opensearch clean geocode-locations extract-entities enrich enrich-status backfill-relationships backfill-relationships-status backfill-embeddings backfill-embeddings-status
 
 # Default target
 help:
@@ -6,7 +6,7 @@ help:
 	@echo ""
 	@echo "Setup:"
 	@echo "  make install        Install all dependencies (backend + frontend)"
-	@echo "  make neo4j          Start Neo4j in Docker"
+	@echo "  make opensearch     Start OpenSearch (Memory Store) in Docker"
 	@echo ""
 	@echo "Data Loading:"
 	@echo "  make load-sample    Load 5 sample transcripts (for testing)"
@@ -42,12 +42,12 @@ install-backend:
 install-frontend:
 	cd frontend && npm install
 
-# Start Neo4j
-neo4j:
+# Start OpenSearch (Memory Store)
+opensearch:
 	docker compose up -d
-	@echo "Waiting for Neo4j to start..."
+	@echo "Waiting for OpenSearch to start..."
 	@sleep 10
-	@echo "Neo4j available at http://localhost:7474"
+	@echo "OpenSearch available at https://localhost:9200"
 
 # Environment variables to suppress warnings during loading
 LOAD_ENV = PYTHONWARNINGS="ignore" HF_HUB_DISABLE_PROGRESS_BARS=1 TOKENIZERS_PARALLELISM=false

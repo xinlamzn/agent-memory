@@ -17,9 +17,14 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import SecretStr
 
-from neo4j_agent_memory import MemoryClient, MemorySettings, Neo4jConfig
+from neo4j_agent_memory import (
+    EmbeddingConfig,
+    EmbeddingProvider,
+    MemoryClient,
+    MemorySettings,
+    MemoryStoreConfig,
+)
 from neo4j_agent_memory.graph.queries import (
     COUNT_ENTITIES_WITHOUT_EMBEDDINGS,
     GET_ENTITIES_WITHOUT_EMBEDDINGS,
@@ -203,28 +208,18 @@ async def main():
     )
     args = parser.parse_args()
 
-    # Get Neo4j config from environment
-    neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    neo4j_user = os.getenv("NEO4J_USERNAME", "neo4j")
-    neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
-    neo4j_database = os.getenv("NEO4J_DATABASE", "neo4j")
-
-    # Get OpenAI API key for embeddings
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        logger.error("OPENAI_API_KEY environment variable is required")
-        sys.exit(1)
-
-    neo4j_config = Neo4jConfig(
-        uri=neo4j_uri,
-        user=neo4j_user,
-        password=SecretStr(neo4j_password),
-        database=neo4j_database,
-    )
-
+    # Get Memory Store config from environment
     settings = MemorySettings(
-        neo4j=neo4j_config,
-        openai_api_key=SecretStr(openai_api_key),
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=os.getenv("MEMORY_STORE_ENDPOINT", "https://localhost:9200"),
+        ),
+        embedding=EmbeddingConfig(
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=os.getenv("AWS_REGION", "us-west-2"),
+        ),
     )
 
     async with MemoryClient(settings) as client:

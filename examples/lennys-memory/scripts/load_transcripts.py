@@ -45,9 +45,14 @@ from pathlib import Path
 from typing import Callable
 
 from dotenv import load_dotenv
-from pydantic import SecretStr
 
-from neo4j_agent_memory import MemoryClient, MemorySettings, Neo4jConfig
+from neo4j_agent_memory import (
+    EmbeddingConfig,
+    EmbeddingProvider,
+    MemoryClient,
+    MemorySettings,
+    MemoryStoreConfig,
+)
 from neo4j_agent_memory.config.settings import (
     ExtractionConfig,
     ExtractorType,
@@ -922,19 +927,14 @@ Performance Tips:
         help="Load only N transcripts (for testing)",
     )
     parser.add_argument(
-        "--neo4j-uri",
-        default=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-        help="Neo4j connection URI (default: from NEO4J_URI env var)",
+        "--memory-store-endpoint",
+        default=os.getenv("MEMORY_STORE_ENDPOINT", "https://localhost:9200"),
+        help="Memory Store endpoint (default: from MEMORY_STORE_ENDPOINT env var)",
     )
     parser.add_argument(
-        "--neo4j-user",
-        default=os.getenv("NEO4J_USERNAME", "neo4j"),
-        help="Neo4j username (default: from NEO4J_USERNAME env var)",
-    )
-    parser.add_argument(
-        "--neo4j-password",
-        default=os.getenv("NEO4J_PASSWORD", "password"),
-        help="Neo4j password (default: from NEO4J_PASSWORD env var)",
+        "--aws-region",
+        default=os.getenv("AWS_REGION", "us-west-2"),
+        help="AWS region for Bedrock embeddings (default: from AWS_REGION env var)",
     )
     parser.add_argument(
         "--no-entities",
@@ -1010,7 +1010,8 @@ Performance Tips:
     print()
     print(f"  {color('Data directory:', Colors.DIM)} {args.data_dir}")
     print(f"  {color('Available files:', Colors.DIM)} {len(files)}")
-    print(f"  {color('Neo4j URI:', Colors.DIM)} {args.neo4j_uri}")
+    print(f"  {color('Memory Store:', Colors.DIM)} {args.memory_store_endpoint}")
+    print(f"  {color('AWS Region:', Colors.DIM)} {args.aws_region}")
     print(f"  {color('Sample size:', Colors.DIM)} {args.sample or 'all'}")
     print(
         f"  {color('Entity extraction:', Colors.DIM)} {color('enabled', Colors.GREEN) if not args.no_entities else color('disabled', Colors.YELLOW)}"
@@ -1040,16 +1041,21 @@ Performance Tips:
     )
 
     settings = MemorySettings(
-        neo4j=Neo4jConfig(
-            uri=args.neo4j_uri,
-            username=args.neo4j_user,
-            password=SecretStr(args.neo4j_password),
+        backend="memory_store",
+        memory_store=MemoryStoreConfig(
+            endpoint=args.memory_store_endpoint,
+        ),
+        embedding=EmbeddingConfig(
+            provider=EmbeddingProvider.BEDROCK,
+            model="amazon.titan-embed-text-v2:0",
+            dimensions=1024,
+            aws_region=args.aws_region,
         ),
         extraction=extraction_config,
     )
 
     if not args.dry_run:
-        print("Connecting to Neo4j...", end=" ", flush=True)
+        print("Connecting to Memory Store...", end=" ", flush=True)
 
     try:
         # Suppress any warnings during connection
