@@ -1,0 +1,343 @@
+Lenny Rachitsky (00:00:00):
+A guide to AI prototyping for product managers
+
+Lenny Rachitsky (00:00:30):
+This post will transform how you build products, come up with new ideas, and operate as a PM.
+
+Whether you’re already deep into AI tools or just getting started, you’ll learn what tools you should be paying attention to, which tool to use when, and how to get unstuck when you run into an issue. You’ll find a collection of battle-tested prompts, real-world examples, and a step-by-step guide you can put into practice immediately. Imagine being able to turn Figma designs into a working app with a few clicks, or turn your PRD into a working prototype in minutes. This is all possible, and you’ll learn how.
+
+Colin Matthews was a longtime PM and now teaches my favorite AI prototyping course: AI Prototyping for Product Managers. He also wrote my 9th most popular post of all time (Become a more technical product manager). I absolutely love how simply and clearly Colin is able to explain complex topics, and I personally learned so much from this post on AI prototyping. I’m confident you will too.
+
+Lenny Rachitsky (00:01:00):
+If you’d like to learn more, check out Colin’s free 30-minute lightning lesson, where he shows you how to build a functional prototype in 10 minutes (including a few advanced techniques). And for much more, check out Colin’s top-rated four-week cohort-based course, where you’ll master AI prototyping tools, learn to debug common issues, and build a fundamental understanding of how coding works. Use code “LENNYSLIST” to get $100 off.
+
+If you haven’t been paying close attention over the past six months, you may have missed the rise of tools like Cursor, Replit Agent, v0, Bolt, and other new cutting-edge AI tools that allow you to build working apps in minutes. For example, it took me 10 minutes to build this 2-D tank game (with an AI opponent included), merely using this series of prompts:
+
+- “Build a 2d tank game with an AI opponent.”
+- “Add collision for the shot when it hits a tank.”
+- “When health hits zero, play an animation and reset the game.”
+- “Improve the acceleration for player movement.”
+- “Make it so holding down the space bar has a timer to shoot a 2nd time.”
+- “Add power ups to the map.”
+
+Lenny Rachitsky (00:01:30):
+Pretty cool. But what’s cooler is that you can use these tools to build functional prototypes from a Figma design, convert a rough hand-drawn sketch to a working app, translate a PRD document into an interactive prototype, or even build a usable internal tool for your team, with no coding ability. In this post, I’ll cover the basics of AI prototyping, show how to get good results out of the most popular tools, and walk through an end-to-end example of building a prototype in less than 10 minutes.
+
+Choosing your tooling
+
+Current AI development tools come in three types:
+
+1. Chatbots (e.g. Claude, ChatGPT): The AI tools you probably know, which can also write and explain basic code
+2. Cloud development environments (e.g. Replit, Bolt, v0, Lovable): Full-stack platforms thatcan build and run your apps in the cloud
+3. Local developer assistants (e.g. GitHub Copliot, Cursor, Windsurf, Zed): Development environments (i.e. IDEs) that help you write code with the help of AI
+
+Lenny Rachitsky (00:02:00):
+Let’s review the most popular tools in each category to see what they can do and what we can build.
+
+Chatbots (ChatGPT, Claude)
+
+Best for: Prototypes that are just one page and don’t have complex design requirements, like calculators, flip cards, or data visualizations*
+
+Chatbots are capable of writing code in response to a question or prompt.
+
+A prompt like “Build me a calculator with React” results in the following:
+
+If you want to run this code, ChatGPT requires you to copy and paste the code into your IDE and run it on your own computer.
+
+Claude goes one step beyond ChatGPT’s abilities with their Artifact system. Artifacts allow you to run the code within Claude’s interface and deploy to a shareable link. An unfortunate limitation is that you can’t make any direct edits to the code, so you’re entirely reliant on using prompts to make code changes.
+
+Lenny Rachitsky (00:02:30):
+(Perplexity is another tool you’ve probably heard of, which feels similar to chatbots but is more focused on search and not as useful for creating apps. It can write basic code because it’s built on top of other AI models like ChatGPT and Claude, but I wouldn’t recommend it for this use case.)
+
+Remember that chatbots can write code for any part of our stack (client, server, database) but can’t host your code (deploy) for us. They also can’t create complex prototypes with multiple pages, and it’s difficult to change the code directly. As a result, these tools are best used for very simple one-time prototypes—which sometimes is enough to get the job done. Think of chatbots when you’re looking to create a very simple landing page, individual inputs like a date picker, or small apps like a to-do list.
+
+Lenny Rachitsky (00:03:00):
+Cloud development environments (Replit, Bolt, v0, Lovable)
+
+Best for: Prototypes with more than one feature, specific design requirements, or many pages*
+
+Cloud development environments are one big step up from chatbots. These tools handle all the tasks required to turn your ideas into an actual working product. They can help you build end-to-end features, handle the backend infrastructure necessary to run your prototype, allow multi-file edits with agentic workflows, and take on more complex tasks across your codebase such as updating your database schema.
+
+One of the key differentiators among the various cloud development environments is hosting. As I explained in my prior post on becoming a more technical PM, every software product is built with three parts: a client, a server, and a database. The client is what the user interacts with (often written in JavaScript), the server processes requests from the client to retrieve data or integrate with other products (often written in Node.js, Python, or Java), and the database is your permanent storage of data. Making prototypes that have real features requires you to host both your client and server code, and may require a database to power the app.
+
+Lenny Rachitsky (00:03:30):
+One of the most popular tools today, v0, is capable of writing and hosting both client and server code. By default it uses specific frameworks called Next.js and Shadcn UI to do so (both were created by Vercel, the same company that owns v0). v0 can deploy your code and run backend servers—plus, one of its strongest features is that it has great styling as a default. Here’s a basic CRM I built in v0 with the prompt “Build me a basic CRM.”
+
+Bolt is very similar to v0 in that it can also generate and deploy both client and server code. But a key difference is where the server runs. With v0, you deploy to real cloud hosting infrastructure, whereas Bolt runs the server code directly in the user’s browser. This means Bolt cannot natively support prototypes that need user identity like logins or accounts, multi-user interactions such as chat or collaborative workspaces, secure data operations like payment processing, or persistent data storage between sessions, because an isolated copy of the server is created on each user’s device. You can make up for this by integrating with external products like Supabase that offer servers and databases.
+
+Lenny Rachitsky (00:04:00):
+Here’s a basic CRM I built with Bolt, using the prompt “Build me a basic CRM.”
+
+Another popular tool is Replit. Replit allows you to build full-stack applications, including a client, server, and database. It can build web apps using both JavaScript and Python frameworks and particularly excels at building internal admin tools (e.g. file conversion, job applicant tracking) and data-driven applications (e.g. image resizing, multi-page dashboards) with simple UIs.
+
+I use Replit whenever I need a fully functional back end or I want to use Python code. I’ve used it to build an MP4-to-GIF converter and a Substack image resizer—both tools I use weekly.
+
+Here’s a basic CRM I built with Replit, using the prompt “Build me a basic CRM.”
+
+Finally, we have Lovable. It’s the newest of the bunch. Lovable is most similar to v0 and Bolt—it excels at generating websites, and uses JavaScript frameworks like React and Next.js. Its differentiation comes from its integrations with other popular tools. Lovable can connect to a GitHub repository, automatically add authentication and databases with Supabase, and help you connect to AI providers like Anthropic and OpenAI. All of these features make it one of the best AI coding tools for building products you actually want to use in production.
+
+Lenny Rachitsky (00:04:30):
+One major drawback of Lovable is the lack of a code editor. To edit code, you have to ask the agent with prompting. This can make it difficult to debug issues directly in Lovable. I often find myself starting a new feature here but moving over to Cursor to resolve problems.
+
+Here’s a basic CRM I built with Lovable, using the prompt “Build me a basic CRM.”
+
+To recap:
+
+- Choose v0 for beautiful designs by default
+- Choose Bolt for quick prototypes with flexible designs
+- Choose Replit for internal tools or products that store or transform data
+- Choose Lovable for building production apps that benefit from integrations with your current tools
+
+Regardless of your choice, cloud development environments all support building more complex applications than chatbots, with the ability to deploy to the cloud and easily share updated iterations over time.
+
+Lenny Rachitsky (00:05:00):
+Local developer assistants (GitHub Copilot, Cursor, Windsurf, Zed)
+
+Best for: People who know how to code and are working on serious applications they want to ship to production*
+
+The final type of AI development tool is local developer assistants. These products are targeted toward people who know how to write code. Tools like Cursor and GitHub Copilot can take prompts in a similar fashion to Claude but can then generate and apply changes within your own codebase and development environment (IDE). These tools do more than autocomplete—they can now write most of your code just using prompts.
+
+For example, I built this presentation app (with live Q&A and polls!) in about 10 days using Lovable and Cursor. I started the app in Lovable to build basic features quickly, synced my code to GitHub to allow editing in other tools, and made final changes and fixed bugs with Cursor. This application uses authentication, databases, real-time updates, and more.
+
+Lenny Rachitsky (00:05:30):
+Ten days may sound like a lot, but most of that time was spent resolving bugs and troubleshooting issues—something Cursor excels at compared with other tools, and something I get into a couple of sections down.
+
+GitHub Copilot is more popular in enterprise environments, as it comes from a trusted vendor, Microsoft. It supports multi-file changes from prompts, code explanations, and more. I’ve found it works best when given very specific direction and does not perform as well as Cursor at more general instructions. For example, when I asked for a new feature without providing context, Copilot re-created components of my app that already existed, whereas Cursor modified my existing files directly.
+
+Two tools I haven’t spent as much time with but people are excited about are Windsurf and Zed. Windsurf is another IDE that can suggest multi-line changes to files and suggest commands such as moving files on your behalf. It excels at working on larger, more complex codebases. Zed is a highly performant editor built with a variety of productivity features such as prompt libraries, slash commands, and keyboard shortcuts for common actions like applying AI-generated code.
+
+Lenny Rachitsky (00:06:00):
+Building your prototype
+
+Now that we’re familiar with the basic tools, let’s build some prototypes. The two most common prototyping use cases for product managers are:
+
+1. Converting an existing design to a functional prototype
+2. Building an idea into a prototype from scratch
+
+Converting a design to a functional prototype
+
+Let’s turn the following design for Airbnb’s home page into a working prototype. Say you want to use this prototype to explore a new feature, such as a price filter.
+
+Here’s our initial design:
+
+I chose Bolt for this task, as it’s better at building off a pre-existing design and we don’t need the backend database provided by Replit. Here’s a prompt I used (which you can copy and paste). Make sure to include a screenshot of the design!
+
+“Build a prototype to match this design. Match it exactly.”
+
+Lenny Rachitsky (00:06:30):
+Here’s how this experience looks in Bolt:
+
+Next, we’ll add our new price filter feature. Notice in the prompt below how I describe every feature in detail. One pro tip with prompting these tools is to be hyperspecific when describing changes for your subsequent prompts, as it helps the AI pinpoint what should change.
+
+“Implement an inline price filter as a component of the search bar. It should appear next to ‘Add guests’ in its own section.
+
+Selecting the input should pop up a price filter with minimum and maximum values. The background of the pop-up should be white and should cover elements beneath it.”
+
+This is a great starting point. Let’s extend this feature with a slider for the minimum price.
+
+“Can you add a price slider? It should have a blue line and a black node. Sliding the node should modify the minimum price.”
+
+Lenny Rachitsky (00:07:00):
+We now have a functional initial prototype of your product idea within 10 minutes! Without any coding skill. Incredible. We could even continue to improve this prototype filter (e.g. showing listings updated in real time as you adjust the price). Check out the prototype here.
+
+Building a prototype from scratch
+
+If you’re like me, your design skills are probably not good enough to create the initial design we used in the prior example. Luckily, you can build a prototype using existing patterns and components from free and publicly available design systems like Tailwind or Shadcn UI.
+
+Let’s build a quick CRM with Bolt, then add a new feature to it. Let’s say we’re considering adding a feature that automates email outreach directly from our CRM and want to gather customer feedback about this feature before building it, by showing potential users a prototype of what it might look like.
+
+Lenny Rachitsky (00:07:30):
+We can quickly put together a v1 with the following prompts:
+
+“Create a comprehensive customer relationship management (CRM) system.”
+
+Again, let’s take a moment to pause here. We just created a working prototype of a CRM in less than five minutes—something that would have previously taken weeks of an engineer’s time. Unbelievable.
+
+Let’s keep going and see how we add a new feature.
+
+“Please implement a mock AI email writer. This should be accessible from the left nav.”
+
+Again, less than five minutes to be able to play with a new feature idea. Just think about how many ideas you can explore and how quickly you can bring them to market. AI prototyping tools have been available for less than six months and have already absolutely changed the speed at which teams can ship.
+
+Now we can take our prototype and get customers’ direct feedback without wasting time developing an initial version. This approach can speed up your discovery process by getting interactive examples in your customers’ hands as early as possible.
+
+Lenny Rachitsky (00:08:00):
+Each AI tool will have very different outcomes based on their default settings and how specific you are. Here’s the exact same example with the same prompts using v0:
+
+Common use cases and prompt templates
+
+Here are a few good templates you can use to get started with each of the tools I’ve highlighted:
+
+Task #1: Build a prototype from an existing Figma design
+
+Prompt:
+
+`Build a prototype to match this design. Match it exactly. Use Tailwindcss.`
+
+`Match styles, fonts, spacing, and colors.`
+
+`[Include a single screenshot from Figma]`
+
+Tool: Bolt
+
+Example: Deployment manager
+
+Task #2: Build a prototype from scratch with good UI design defaults
+
+Prompt
+
+`Build a prototype for [x].`
+
+`This tool should:
+- [Behavior 1]`
+
+`- [Behavior 2]`
+
+`- [Behavior 3]`
+
+`Implement a simple initial iteration that meets these exact requirements.`
+
+Lenny Rachitsky (00:08:30):
+Example: Sales calculator
+
+Task #3: Build a dashboard to visualize data
+
+Prompt:
+
+`Build a prototype for [x].`
+
+`Use Python and Streamlit.`
+
+Tool: Replit
+
+Example: Product analytics dashboard
+
+Task #4: Convert a hand-drawn mockup to a prototype
+
+Prompt:
+
+`Convert the hand-drawn sketch to a functional prototype. Focus on frontend functionality.`
+
+`Make it in the style of [product you like].`
+
+Tool: v0
+
+Example: Netflix-inspired blog
+
+Task #5: Convert a PRD to prototype
+
+Prompt:
+
+`Implement a prototype to match the features in this PRD. Follow the exact specifications in the document. Focus on front end functionality -- do not include a server or database. Use Tailwindcss
+
+[Copy/paste PRD. Include any relevant images]`
+
+Tool: Bolt
+
+Example: 2-factor authentication UI
+
+Task #6: Build your personalized productivity tool
+
+Prompt:
+
+`Build a tool that does [x].
+
+Lenny Rachitsky (00:09:00):
+This tool should:
+- [Behavior 1]`
+
+`- [Behavior 2]`
+
+`- [Behavior 3]`
+
+Tool: Replit
+
+Example: Substack image resizer
+
+Solving prototyping problems—without knowing how to code
+
+Building your initial prototype is one thing. But one of the most common frustrations with AI prototyping is the errors the AI makes along the way toward a functional version. If you try to do anything even slightly complex, you’re likely to hit a wall. Knowing how to code becomes a superpower for debugging, but there are other approaches non-technical builders can use to still get great results.
+
+Let’s break down the four most effective ways to get to functional prototypes:
+
+1. Reflection
+2. Batching
+3. Be specific
+4. Lost context
+
+Reflection
+
+Reflection is the most important strategy for getting useful outputs from AI coding tools. These tools will respond to any question by writing code by default, which often means there’s no real plan. By forcing the AI to build a plan first vs. going straight to code, you’ll get much better results and have more visibility into what’s happening.
+
+Lenny Rachitsky (00:09:30):
+Example:
+
+“Build me a calorie tracking app with only a front end. Start by detailing out the minimum requirements. Do not write any code.”
+
+You can also use reflection to get out of a loop. Rather than asking the AI to fix your syntax errors, ask it to come up with a list of possible reasons an error exists. Be explicit about not wanting code, only an explanation of what’s happening.
+
+Batching
+
+Batching is a little unintuitive. Most people think that providing the most context up front will help the AI make the right decisions, but the opposite is true. You want to build the smallest iteration of something functional and then extend it. Try breaking down your prompts into smaller batches rather than asking for a complex prototype up front. I recommend starting with the data model first, as this is the backbone of how your prototype will store information.
+
+Lenny Rachitsky (00:10:00):
+Example:
+
+“Implement only the client-side view for calorie tracking. Use a basic data model that tracks entries with a description and number of associated calories. Display a table of all current entries and the sum of total calories in the top right corner.”
+
+Be specific
+
+The more specific you can be with AI, the more likely you are to get what you want. Just like if you were working with a junior engineer. Being specific comes in all forms—what technologies you’re using, what parts of the product should be built, and what files or even specific lines of code should change.
+
+Example:
+
+*“Add the ability to track calories on each day.
+- Extend the data model to include a date for the entry
+- Display a date picker in the entry form, defaulted to today’s date
+- Display today’s date inline with the total calorie amount
+- Add a left and right navigation arrow inline with the calorie amount to switch days backward and forward
+- The total calorie amount should show the sum of calories on the specified date.”*
+
+Lenny Rachitsky (00:10:30):
+One of the most frustrating experiences of using AI prototyping tools is when they rewrite entire sections of your prototype and you lose hours of work. This often happens when your instructions are not specific enough and the AI cannot figure out the correct changes to make, so it rewrites everything. Fortunately, most tools have built a checkpoint system, where you can easily roll back to a prior version.
+
+You can also avoid losing context by focusing the AI on specific parts of the product that need to change. This can be done using a combination of the above strategies:
+
+1. Reflection to determine what files need to change
+2. Batching to limit the changes in each iteration
+3. Being specific to minimize the chance of incorrect results
+
+Putting it all together
+
+AI prototyping is changing the way product teams work. Instead of spending weeks or months waiting for a feature to ship, you can build a prototype and get immediate feedback. Ship an internal tool in a day and see if it actually solves a problem. Sketch a mockup on a whiteboard and turn it into an app the same day.
+
+Lenny Rachitsky (00:11:00):
+It sounds magical (and it definitely feels like magic), but there are limitations. Most product managers should use cloud development environments like:
+
+- v0 for beautiful designs by default
+- Bolt for quick prototypes with flexible designs
+- Replit for internal or data-driven tools
+- Lovable for building production apps and great integrations
+
+As you’re working on your prototype, you’re likely to run into issues. Be specific, reflect on the process, and try small incremental batches to get the best results.
+
+📚 Further study
+
+1. Maximizing outputs with v0: From UI generation to code creation—Vercel
+2. Prompt engineering overview—Anthropic
+3. Build a fullstack app in 7 minutes with v0 (Figma to code)
+4. Bolt tutorial for beginners with the Bolt CEO Eric Simons
+5. Windsurf vs. Cursor: which is the better AI code editor?
+
+Lenny Rachitsky (00:11:30):
+If you’d like to learn more, Colin is teaching a free 30-minute lightning lesson on January 14th where he’ll show you how to build a functional prototype in 10 minutes (including a few advanced techniques). Sign up here. For much more hands-on learning, sign up for Colin’s live four-week cohort-based course on AI prototyping, where you’ll master AI prototyping tools, debug common issues, and build a fundamental understanding of how coding works. Use code “LENNYSLIST” to get $100 off. Enrollment closes January 23rd.
+
+Have a fulfilling and productive week 🙏
+
+Hiring? 👀
+
+I run a white-glove recruiting service specializing in senior product roles (e.g. Directors, VPs, and Heads of Product), working with a few select companies to fill their open roles. If you’re hiring, apply to work with us below.
+
+Start hiring
+
+If you’re finding this newsletter valuable, share it with a friend, and consider subscribing if you haven’t already. There are group discounts, gift options, and referral bonuses available.

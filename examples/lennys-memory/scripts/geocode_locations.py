@@ -101,10 +101,23 @@ async def main():
         user_agent="lennys-memory/1.0",
     )
 
+    # Build Memory Store config with optional auth from environment
+    memory_store_username = os.getenv("MEMORY_STORE_USERNAME")
+    memory_store_password = os.getenv("MEMORY_STORE_PASSWORD")
+    memory_store_verify_ssl = os.getenv("MEMORY_STORE_VERIFY_SSL", "true").lower() not in (
+        "false",
+        "0",
+        "no",
+    )
+
     settings = MemorySettings(
         backend="memory_store",
         memory_store=MemoryStoreConfig(
             endpoint=memory_store_endpoint,
+            username=memory_store_username,
+            password=SecretStr(memory_store_password) if memory_store_password else None,
+            verify_ssl=memory_store_verify_ssl,
+            user_id=memory_store_username or "default",
         ),
         embedding=EmbeddingConfig(
             provider=EmbeddingProvider.BEDROCK,

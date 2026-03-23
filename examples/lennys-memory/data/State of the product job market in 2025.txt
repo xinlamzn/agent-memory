@@ -1,0 +1,102 @@
+Lenny Rachitsky (00:00:00):
+State of the product job market in 2025
+
+Lenny Rachitsky (00:00:30):
+Last year, I did a two-part series on the state of the product job market (see part 1, part 2), where we found:
+
+1. A shift toward hiring senior candidates
+2. The decline of Scrum
+3. The share of remote roles shrinking
+4. The share of PM roles based in the Bay Area growing
+
+It’s a great time to revisit the state of the product job market, and there’s a lot to be optimistic about! We’re seeing:
+
+1. Open PM and engineering roles are trending up
+2. AI PM roles (and AI-related roles in general) are exploding
+3. Layoffs are slowing
+4. Capital investment is increasing
+5. The Bay Area continues to be the center of opportunity
+6. Remote work opportunities are declining—and are probably near a new baseline
+7. There are lots of open PM roles around the world
+
+A big thank-you to TrueUp for making this analysis possible through their incredible dataset. They continuously scan every open job at every big tech company and every top startup, and then categorize and tag each role. You can browse all open PM roles here, and sign up to get job alerts when new product roles are posted.
+
+Lenny Rachitsky (00:01:00):
+Now, on to the data.
+
+P.S. If you prefer, you can listen to this post in convenient podcast form: Spotify / Apple / YouTube.
+
+1. Open PM and engineering roles are trending up
+
+In spite of what you’re hearing about recessions and AI taking jobs, open roles for product managers and engineers at tech companies are increasing.
+
+There are over 6,000 open PM roles globally right now—53.6% above the bottom we saw in 2023, and already up 11% since the start of the year. This is the most open PM roles we’ve seen in over two years.
+
+Engineering role growth looks very similar—just scaled up 10x. Open engineering roles saw an uptick earlier this year, and we’re currently seeing the highest number of open roles since late 2022.
+
+Designer roles have been more stable over time than PM and engineering. They do seem to be dipping a bit recently, but they also never saw as deep a dip as PM and engineering did over the past few years.
+
+Lenny Rachitsky (00:01:30):
+2. AI roles are exploding
+
+When you look at just AI PM roles—which includes roles at both AI companies (e.g. OpenAI, Anthropic, Scale) and roles specifically focused on AI products/features at any tech company (e.g. AI/ML PM at Salesforce), the growth we’re seeing is insane. There are 688 open AI PM roles today.
+
+Zooming out further, here are all “AI” open roles globally. This includes all open roles at what we consider AI companies (e.g. OpenAI, Anthropic, Scale), roles at companies that are heavily AI-driven (e.g. Cursor, Harvey, Lovable), and AI-specific roles at non-AI companies (e.g. AI PM at Figma).
+
+3. Layoffs are slowing
+
+More good news: We’re on track to see fewer layoffs this year than in the past four years. However, the possibility of future cuts is ever-present, even at the most respected companies.
+
+Lenny Rachitsky (00:02:00):
+4. Capital investment is increasing
+
+We’re seeing more capital investment (e.g. GPUs, data centers, etc.) this year than ever (+29% from last year, +227% from five years ago). It’s still unclear if this only means more hardware or whether it will also lead to more jobs, but I’d rather see this than have it going in the other direction.
+
+5. The Bay Area continues to be the center of opportunity
+
+For most tech roles, the Bay Area continues to have the most open roles of any city.
+
+For PMs, nearly 20% of all open roles are based in the Bay Area.
+
+Since our last analysis, Berlin and Austin entered the top 10 locations with the most open PM roles, and Boston and L.A. fell out of the top 10.
+
+For engineering, over 17% of all open roles are based in the Bay Area—and that share is increasing.
+
+Even more so for design roles (assuming that recent dip is temporary).
+
+Lenny Rachitsky (00:02:30):
+The share of roles based in the Bay Area is even more interesting for “AI” jobs—almost a third of all open AI-related roles globally continue to be based in the Bay Area. 😮
+
+6. Remote work opportunities are declining
+
+The number of roles that allow you to work remotely continues to decline. At remote work’s peak in late 2022, we saw about 35% listed open PM roles as remote-friendly. Today, only 23% have a remote option.
+
+The trend is clear, and we’re probably near the new baseline of around 20% of roles being remote-friendly.
+
+That trend is identical for engineering and designer roles.
+
+7. There are lots of open PM roles around the world
+
+Finally, if you’re looking for a PM gig and having a hard time, keep going. The roles are out there.
+
+Here’s a list of the top 20 companies that have the most open roles. You can browse all the open roles here.
+
+Lenny Rachitsky (00:03:00):
+If you’re looking for an AI PM role specifically, here’s who’s hiring:
+
+Other trends we’re following
+
+1. The rise of the product engineer: We’re seeing 415 open Product Engineer roles currently (e.g. v0, Amplitude, n8n), and this seems to be growing.
+2. How AI copilot tools change PM interviewing: We’re seeing anecdotal evidence that this is becoming an issue and will change how PMs interview.
+
+Overall, there’s a lot to be optimistic about!
+
+I’m excited to continue to follow changes in the job market for product roles. Stay tuned for more updates.
+
+Have a fulfilling and productive week 🙏
+
+If you’re finding this newsletter valuable, share it with a friend, and consider subscribing if you haven’t already. There are group discounts, gift options, and referral bonuses available.
+
+Sincerely,
+
+Lenny 👋

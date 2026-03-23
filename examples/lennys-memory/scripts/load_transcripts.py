@@ -1040,10 +1040,25 @@ Performance Tips:
         gliner_threshold=0.4,  # Lower threshold to capture more entities
     )
 
+    # Build Memory Store config with optional auth from environment
+    memory_store_username = os.getenv("MEMORY_STORE_USERNAME")
+    memory_store_password = os.getenv("MEMORY_STORE_PASSWORD")
+    memory_store_verify_ssl = os.getenv("MEMORY_STORE_VERIFY_SSL", "true").lower() not in (
+        "false",
+        "0",
+        "no",
+    )
+
+    from pydantic import SecretStr
+
     settings = MemorySettings(
         backend="memory_store",
         memory_store=MemoryStoreConfig(
             endpoint=args.memory_store_endpoint,
+            username=memory_store_username,
+            password=SecretStr(memory_store_password) if memory_store_password else None,
+            verify_ssl=memory_store_verify_ssl,
+            user_id=memory_store_username or "default",
         ),
         embedding=EmbeddingConfig(
             provider=EmbeddingProvider.BEDROCK,
