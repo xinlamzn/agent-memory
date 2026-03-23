@@ -2,6 +2,9 @@
 
 Provides graph algorithms for enhanced context ranking and entity analysis.
 Supports fallback to basic Cypher when GDS library is not installed.
+
+All GDS operations require the Neo4j backend.  When the Memory Store
+backend is active, methods raise ``UnsupportedBackendOperation``.
 """
 
 from __future__ import annotations
@@ -10,6 +13,8 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
+
+from neo4j_agent_memory.graph.backend_protocol import UnsupportedBackendOperation
 
 if TYPE_CHECKING:
     from neo4j_agent_memory import MemoryClient
@@ -115,6 +120,15 @@ class GDSIntegration:
         self._gds_available: bool | None = None
         self._fallback_warned: bool = False
 
+    def _require_neo4j(self, operation: str) -> None:
+        """Raise if the current backend does not support raw queries."""
+        if not self._client.capabilities.supports_raw_query:
+            raise UnsupportedBackendOperation(
+                f"GDS {operation}",
+                self._client.backend.backend_name,
+                hint="GDS graph algorithms require the Neo4j backend.",
+            )
+
     @property
     def config(self) -> GDSConfig:
         """Get the GDS configuration."""
@@ -127,6 +141,8 @@ class GDSIntegration:
         Returns:
             True if GDS is available, False otherwise.
         """
+        self._require_neo4j("is_gds_available")
+
         if self._gds_available is not None:
             return self._gds_available
 
@@ -170,6 +186,8 @@ class GDSIntegration:
         Returns:
             List of (entity_id, score) tuples sorted by score descending.
         """
+        self._require_neo4j("get_pagerank_scores")
+
         if not entity_ids:
             return []
 
@@ -265,6 +283,8 @@ class GDSIntegration:
         Returns:
             Dict mapping entity_id to community_id.
         """
+        self._require_neo4j("detect_communities")
+
         if not entity_ids:
             return {}
 
@@ -357,7 +377,8 @@ class GDSIntegration:
         Returns:
             List of nodes in the path, or None if no path exists.
         """
-        # This doesn't require GDS - use built-in shortestPath
+        self._require_neo4j("find_shortest_path")
+
         query = f"""
         MATCH (source:Entity)
         WHERE source.name = $source OR source.id = $source
@@ -406,6 +427,8 @@ class GDSIntegration:
         Returns:
             List of similar entities with similarity scores.
         """
+        self._require_neo4j("find_similar_entities")
+
         if await self.is_gds_available():
             return await self._similarity_gds(entity_id, limit)
         elif self._config.fallback_to_basic:
@@ -472,6 +495,8 @@ class GDSIntegration:
         Returns:
             List of central entities with scores.
         """
+        self._require_neo4j("get_central_entities")
+
         if algorithm == GDSAlgorithm.PAGERANK:
             if entity_ids:
                 scores = await self.get_pagerank_scores(entity_ids)

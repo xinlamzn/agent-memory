@@ -355,6 +355,8 @@ class TestEntityRelationships:
         client.short_term = MagicMock()
         client.long_term = MagicMock()
         client._client = MagicMock()
+        client.backend = MagicMock()
+        client.backend.graph = MagicMock()
         client.short_term.search_messages = AsyncMock(return_value=[])
         client.long_term.search_entities = AsyncMock(return_value=[])
         client.long_term.search_preferences = AsyncMock(return_value=[])
@@ -365,23 +367,30 @@ class TestEntityRelationships:
         """Test getting relationships for an existing entity."""
         from neo4j_agent_memory.integrations.agentcore import HybridMemoryProvider
 
-        mock_memory_client._client.execute_read = AsyncMock(
+        # Mock search_entities to return an entity
+        mock_entity = MagicMock()
+        mock_entity.id = "entity-1"
+        mock_entity.display_name = "John Doe"
+        mock_entity.type = MagicMock(value="PERSON")
+        mock_entity.description = "A developer"
+        mock_memory_client.long_term.search_entities = AsyncMock(
+            return_value=[mock_entity]
+        )
+
+        # Mock traverse to return neighbors with edges
+        mock_memory_client.backend.graph.traverse = AsyncMock(
             return_value=[
                 {
-                    "entity_name": "John Doe",
-                    "entity_type": "PERSON",
-                    "entity_description": "A developer",
-                    "from_entity": "John Doe",
-                    "relationship": "WORKS_AT",
-                    "to_entity": "Acme Corp",
+                    "id": "entity-2",
+                    "displayName": "Acme Corp",
+                    "type": "ORGANIZATION",
+                    "_edge": {"type": "WORKS_AT"},
                 },
                 {
-                    "entity_name": "John Doe",
-                    "entity_type": "PERSON",
-                    "entity_description": "A developer",
-                    "from_entity": "John Doe",
-                    "relationship": "KNOWS",
-                    "to_entity": "Jane Smith",
+                    "id": "entity-3",
+                    "displayName": "Jane Smith",
+                    "type": "PERSON",
+                    "_edge": {"type": "KNOWS"},
                 },
             ]
         )
@@ -399,7 +408,7 @@ class TestEntityRelationships:
         """Test getting relationships for a non-existent entity."""
         from neo4j_agent_memory.integrations.agentcore import HybridMemoryProvider
 
-        mock_memory_client._client.execute_read = AsyncMock(return_value=[])
+        mock_memory_client.long_term.search_entities = AsyncMock(return_value=[])
 
         provider = HybridMemoryProvider(memory_client=mock_memory_client)
 
@@ -412,7 +421,16 @@ class TestEntityRelationships:
         """Test filtering relationships by type."""
         from neo4j_agent_memory.integrations.agentcore import HybridMemoryProvider
 
-        mock_memory_client._client.execute_read = AsyncMock(return_value=[])
+        # Mock search_entities to return an entity
+        mock_entity = MagicMock()
+        mock_entity.id = "entity-1"
+        mock_entity.display_name = "John Doe"
+        mock_entity.type = MagicMock(value="PERSON")
+        mock_entity.description = "A developer"
+        mock_memory_client.long_term.search_entities = AsyncMock(
+            return_value=[mock_entity]
+        )
+        mock_memory_client.backend.graph.traverse = AsyncMock(return_value=[])
 
         provider = HybridMemoryProvider(memory_client=mock_memory_client)
 
@@ -421,8 +439,8 @@ class TestEntityRelationships:
             relationship_types=["WORKS_AT", "MANAGES"],
         )
 
-        # Check that execute_read was called (query was executed)
-        mock_memory_client._client.execute_read.assert_called_once()
+        # Check that traverse was called with the specified types
+        mock_memory_client.backend.graph.traverse.assert_called_once()
 
 
 class TestIncludeFilters:

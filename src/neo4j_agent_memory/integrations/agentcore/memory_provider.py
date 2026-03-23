@@ -380,17 +380,9 @@ class Neo4jMemoryProvider:
 
         # Try deleting from short-term memory
         try:
-            # Use Cypher to delete the message
-            query = """
-            MATCH (m:Message {id: $memory_id})
-            DETACH DELETE m
-            RETURN count(m) AS deleted
-            """
-            result = await self._client._client.execute_write(
-                query,
-                {"memory_id": memory_id},
-            )
-            if result and result[0].get("deleted", 0) > 0:
+            if await self._client.backend.graph.delete_node(
+                "Message", memory_id, detach=True
+            ):
                 deleted = True
         except Exception as e:
             logger.debug(f"Message deletion failed: {e}")
@@ -398,16 +390,9 @@ class Neo4jMemoryProvider:
         # Try deleting from entity store
         if not deleted:
             try:
-                query = """
-                MATCH (e:Entity {id: $memory_id})
-                DETACH DELETE e
-                RETURN count(e) AS deleted
-                """
-                result = await self._client._client.execute_write(
-                    query,
-                    {"memory_id": memory_id},
-                )
-                if result and result[0].get("deleted", 0) > 0:
+                if await self._client.backend.graph.delete_node(
+                    "Entity", memory_id, detach=True
+                ):
                     deleted = True
             except Exception as e:
                 logger.debug(f"Entity deletion failed: {e}")
@@ -415,16 +400,9 @@ class Neo4jMemoryProvider:
         # Try deleting from preference store
         if not deleted:
             try:
-                query = """
-                MATCH (p:Preference {id: $memory_id})
-                DETACH DELETE p
-                RETURN count(p) AS deleted
-                """
-                result = await self._client._client.execute_write(
-                    query,
-                    {"memory_id": memory_id},
-                )
-                if result and result[0].get("deleted", 0) > 0:
+                if await self._client.backend.graph.delete_node(
+                    "Preference", memory_id, detach=True
+                ):
                     deleted = True
             except Exception as e:
                 logger.debug(f"Preference deletion failed: {e}")
@@ -446,17 +424,19 @@ class Neo4jMemoryProvider:
         count = 0
 
         try:
-            query = """
-            MATCH (m:Message {sessionId: $session_id})
-            DETACH DELETE m
-            RETURN count(m) AS deleted
-            """
-            result = await self._client._client.execute_write(
-                query,
-                {"session_id": session_id},
+            # Query all messages for the session, then delete each one.
+            messages = await self._client.backend.graph.query_nodes(
+                "Message",
+                filters={"sessionId": session_id},
+                limit=10000,
             )
-            if result:
-                count = result[0].get("deleted", 0)
+            for msg in messages:
+                msg_id = msg.get("id")
+                if msg_id:
+                    if await self._client.backend.graph.delete_node(
+                        "Message", msg_id, detach=True
+                    ):
+                        count += 1
 
             # Remove from local session cache
             self._sessions.pop(session_id, None)

@@ -92,11 +92,28 @@ def _create_memory_store_bundle(settings: "MemorySettings") -> BackendBundle:
             hint="Set settings.memory_store to a MemoryStoreConfig instance.",
         )
 
-    # Stage 2: Memory Store backend implementations will be imported here.
-    # For now, raise a clear error indicating this backend is not yet available.
-    raise UnsupportedBackendOperation(
-        "create_backend",
-        "memory_store",
-        hint="The memory_store backend is not yet implemented. "
-        "It will be available in a future release.",
+    from neo4j_agent_memory.graph.memory_store_backend import MemoryStoreGraphBackend
+    from neo4j_agent_memory.graph.memory_store_schema_backend import MemoryStoreSchemaBackend
+    from neo4j_agent_memory.graph.memory_store_utility_backend import MemoryStoreUtilityBackend
+
+    graph = MemoryStoreGraphBackend(settings.memory_store)
+    schema = MemoryStoreSchemaBackend(graph)
+    utility = MemoryStoreUtilityBackend(graph)
+
+    capabilities = BackendCapabilities(
+        supports_raw_query=False,
+        supports_schema_management=False,
+        supports_schema_persistence=False,
+        supports_graph_export=True,
+        supports_geo_search=False,
+        supports_vector_search=True,
+        supports_transactions=False,
+    )
+
+    return BackendBundle(
+        graph=graph,
+        schema=schema,
+        utility=utility,
+        capabilities=capabilities,
+        backend_name="memory_store",
     )

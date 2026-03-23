@@ -104,11 +104,8 @@ def register_resources(mcp: FastMCP) -> None:
         """
         client = get_client(ctx)
         try:
-            records = await client.graph.execute_read(
-                "MATCH (n) RETURN labels(n) AS labels, count(*) AS count",
-                {},
-            )
-            return json.dumps({"stats": records}, default=str)
+            stats = await client.backend.utility.get_stats()
+            return json.dumps({"stats": stats}, default=str)
         except Exception as e:
             logger.error(f"Error getting graph stats: {e}")
             return json.dumps({"error": str(e)})

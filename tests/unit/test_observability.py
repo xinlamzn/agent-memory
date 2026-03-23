@@ -18,6 +18,12 @@ from neo4j_agent_memory.observability.base import (
     is_opik_available,
 )
 
+try:
+    import opentelemetry.sdk  # noqa: F401
+    _otel_sdk_available = True
+except ImportError:
+    _otel_sdk_available = False
+
 
 class TestNoOpSpan:
     """Tests for NoOpSpan."""
@@ -256,7 +262,7 @@ class TestTracerAbstract:
 class TestOpenTelemetryTracer:
     """Tests for OpenTelemetry tracer (when available)."""
 
-    @pytest.mark.skipif(not is_opentelemetry_available(), reason="OpenTelemetry not installed")
+    @pytest.mark.skipif(not _otel_sdk_available, reason="OpenTelemetry SDK not installed")
     def test_create_otel_tracer(self):
         """Test creating OpenTelemetry tracer."""
         from neo4j_agent_memory.observability.otel import OpenTelemetryTracer
@@ -264,7 +270,7 @@ class TestOpenTelemetryTracer:
         tracer = OpenTelemetryTracer(service_name="test-service")
         assert tracer.service_name == "test-service"
 
-    @pytest.mark.skipif(not is_opentelemetry_available(), reason="OpenTelemetry not installed")
+    @pytest.mark.skipif(not _otel_sdk_available, reason="OpenTelemetry SDK not installed")
     def test_otel_tracer_start_span(self):
         """Test starting a span with OpenTelemetry tracer."""
         from neo4j_agent_memory.observability.otel import OpenTelemetryTracer
@@ -274,7 +280,7 @@ class TestOpenTelemetryTracer:
         assert span is not None
         span.end()
 
-    @pytest.mark.skipif(not is_opentelemetry_available(), reason="OpenTelemetry not installed")
+    @pytest.mark.skipif(not _otel_sdk_available, reason="OpenTelemetry SDK not installed")
     def test_otel_span_attributes(self):
         """Test setting attributes on OpenTelemetry span."""
         from neo4j_agent_memory.observability.otel import OpenTelemetryTracer
@@ -289,7 +295,7 @@ class TestOpenTelemetryTracer:
         span.set_attribute("complex_attr", {"nested": "value"})  # Should convert to string
         span.end()
 
-    @pytest.mark.skipif(not is_opentelemetry_available(), reason="OpenTelemetry not installed")
+    @pytest.mark.skipif(not _otel_sdk_available, reason="OpenTelemetry SDK not installed")
     def test_otel_span_status(self):
         """Test setting status on OpenTelemetry span."""
         from neo4j_agent_memory.observability.otel import OpenTelemetryTracer
@@ -300,7 +306,7 @@ class TestOpenTelemetryTracer:
         span.set_status("ERROR", "something went wrong")
         span.end()
 
-    @pytest.mark.skipif(not is_opentelemetry_available(), reason="OpenTelemetry not installed")
+    @pytest.mark.skipif(not _otel_sdk_available, reason="OpenTelemetry SDK not installed")
     def test_otel_span_exception(self):
         """Test recording exception on OpenTelemetry span."""
         from neo4j_agent_memory.observability.otel import OpenTelemetryTracer

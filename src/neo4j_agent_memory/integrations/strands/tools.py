@@ -217,26 +217,23 @@ def _create_search_context_tool(
                         # Include relationships if requested
                         if include_relationships and hasattr(entity, "id"):
                             try:
-                                # Get relationships via Cypher
-                                rel_query = """
-                                MATCH (e:Entity {id: $entity_id})-[r]-(other:Entity)
-                                RETURN type(r) AS relationship,
-                                       other.displayName AS related_entity,
-                                       other.type AS related_type
-                                LIMIT 10
-                                """
-                                rels = await client._client.execute_read(
-                                    rel_query,
-                                    {"entity_id": str(entity.id)},
+                                traversal = await client.backend.graph.traverse(
+                                    start_label="Entity",
+                                    start_id=str(entity.id),
+                                    direction="both",
+                                    depth=1,
+                                    include_edges=True,
+                                    limit=10,
                                 )
-                                if rels:
+                                if traversal:
                                     entity_data["relationships"] = [
                                         {
-                                            "type": r["relationship"],
-                                            "entity": r["related_entity"],
-                                            "entity_type": r["related_type"],
+                                            "type": n.get("_edge", {}).get("type", "RELATED_TO"),
+                                            "entity": n.get("displayName", n.get("name", "")),
+                                            "entity_type": n.get("type", ""),
                                         }
-                                        for r in rels
+                                        for n in traversal
+                                        if n.get("id")
                                     ]
                             except Exception as e:
                                 logger.debug(f"Relationship fetch failed: {e}")
@@ -341,34 +338,15 @@ def _create_get_entity_graph_tool(
                 # Clamp depth to safe range
                 safe_depth = min(max(depth, 1), 3)
 
-                # Build relationship type filter
-                rel_filter = ""
-                if relationship_types:
-                    rel_types = "|".join(relationship_types)
-                    rel_filter = f":{rel_types}"
-
-                # Get the subgraph
-                query = f"""
-                MATCH path = (start:Entity {{id: $entity_id}})-[r{rel_filter}*1..{safe_depth}]-(connected:Entity)
-                WITH start, connected, relationships(path) AS rels, nodes(path) AS pathNodes
-                UNWIND rels AS rel
-                WITH start, connected,
-                     startNode(rel) AS from_node,
-                     endNode(rel) AS to_node,
-                     type(rel) AS rel_type
-                RETURN DISTINCT
-                    from_node.displayName AS from_entity,
-                    from_node.type AS from_type,
-                    rel_type AS relationship,
-                    to_node.displayName AS to_entity,
-                    to_node.type AS to_type
-                LIMIT 50
-                """
-
                 try:
-                    records = await client._client.execute_read(
-                        query,
-                        {"entity_id": entity_id},
+                    traversal = await client.backend.graph.traverse(
+                        start_label="Entity",
+                        start_id=entity_id,
+                        relationship_types=relationship_types,
+                        direction="both",
+                        depth=safe_depth,
+                        include_edges=True,
+                        limit=50,
                     )
 
                     # Build graph structure
@@ -387,32 +365,25 @@ def _create_get_entity_graph_tool(
 
                     edges: list[dict[str, str]] = []
 
-                    for record in records:
-                        # Add nodes
-                        from_name = record["from_entity"]
-                        to_name = record["to_entity"]
+                    for n in traversal:
+                        neighbor_name = n.get("displayName", n.get("name", ""))
+                        neighbor_type = n.get("type", "Entity")
+                        edge = n.get("_edge", {})
+                        rel_type = edge.get("type", "RELATED_TO")
 
-                        if from_name and from_name not in nodes:
-                            nodes[from_name] = {
-                                "name": from_name,
-                                "type": record["from_type"],
+                        if neighbor_name and neighbor_name not in nodes:
+                            nodes[neighbor_name] = {
+                                "name": neighbor_name,
+                                "type": neighbor_type,
                                 "is_center": False,
                             }
 
-                        if to_name and to_name not in nodes:
-                            nodes[to_name] = {
-                                "name": to_name,
-                                "type": record["to_type"],
-                                "is_center": False,
-                            }
-
-                        # Add edge
-                        if from_name and to_name:
+                        if neighbor_name:
                             edges.append(
                                 {
-                                    "from": from_name,
-                                    "to": to_name,
-                                    "relationship": record["relationship"],
+                                    "from": entity.display_name,
+                                    "to": neighbor_name,
+                                    "relationship": rel_type,
                                 }
                             )
 

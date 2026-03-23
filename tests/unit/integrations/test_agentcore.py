@@ -230,6 +230,11 @@ class TestNeo4jMemoryProvider:
         client.long_term = MagicMock()
         client.reasoning = MagicMock()
         client._client = MagicMock()
+        client.backend = MagicMock()
+        client.backend.graph = MagicMock()
+        client.backend.utility = MagicMock()
+        client.capabilities = MagicMock()
+        client.capabilities.supports_raw_query = True
         client.get_context = AsyncMock(return_value="Formatted context")
         return client
 
@@ -373,23 +378,23 @@ class TestNeo4jMemoryProvider:
         """Test deleting a memory."""
         from neo4j_agent_memory.integrations.agentcore import Neo4jMemoryProvider
 
-        # Setup mock
-        mock_memory_client._client.execute_write = AsyncMock(return_value=[{"deleted": 1}])
+        # Setup mock: first call (Message) returns True
+        mock_memory_client.backend.graph.delete_node = AsyncMock(return_value=True)
 
         provider = Neo4jMemoryProvider(memory_client=mock_memory_client)
 
         result = await provider.delete_memory("mem-123")
 
         assert result is True
-        mock_memory_client._client.execute_write.assert_called()
+        mock_memory_client.backend.graph.delete_node.assert_called()
 
     @pytest.mark.asyncio
     async def test_delete_memory_not_found(self, mock_memory_client: MagicMock) -> None:
         """Test deleting a non-existent memory."""
         from neo4j_agent_memory.integrations.agentcore import Neo4jMemoryProvider
 
-        # Setup mock to return 0 deleted
-        mock_memory_client._client.execute_write = AsyncMock(return_value=[{"deleted": 0}])
+        # Setup mock to return False for all labels
+        mock_memory_client.backend.graph.delete_node = AsyncMock(return_value=False)
 
         provider = Neo4jMemoryProvider(memory_client=mock_memory_client)
 
@@ -402,8 +407,11 @@ class TestNeo4jMemoryProvider:
         """Test clearing a session."""
         from neo4j_agent_memory.integrations.agentcore import Neo4jMemoryProvider
 
-        # Setup mock
-        mock_memory_client._client.execute_write = AsyncMock(return_value=[{"deleted": 5}])
+        # Setup mock: query_nodes returns 5 messages, delete_node returns True
+        mock_memory_client.backend.graph.query_nodes = AsyncMock(
+            return_value=[{"id": f"msg-{i}"} for i in range(5)]
+        )
+        mock_memory_client.backend.graph.delete_node = AsyncMock(return_value=True)
 
         provider = Neo4jMemoryProvider(memory_client=mock_memory_client)
 

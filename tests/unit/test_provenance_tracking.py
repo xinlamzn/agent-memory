@@ -10,10 +10,17 @@ from neo4j_agent_memory.memory.long_term import Entity, LongTermMemory
 
 @pytest.fixture
 def mock_client():
-    """Create a mock Neo4jClient."""
+    """Create a mock GraphBackend client."""
     client = MagicMock()
-    client.execute_read = AsyncMock()
-    client.execute_write = AsyncMock()
+    client.upsert_node = AsyncMock(return_value={})
+    client.get_node = AsyncMock(return_value=None)
+    client.link_nodes = AsyncMock(return_value={})
+    client.traverse = AsyncMock(return_value=[])
+    client.query_nodes = AsyncMock(return_value=[])
+    client.count_nodes = AsyncMock(return_value=0)
+    client.unlink_nodes = AsyncMock(return_value=True)
+    client.vector_search = AsyncMock(return_value=[])
+    client.update_node = AsyncMock(return_value={})
     return client
 
 
@@ -53,15 +60,12 @@ class TestRegisterExtractor:
     @pytest.mark.asyncio
     async def test_register_new_extractor(self, long_term_memory, mock_client):
         """Test registering a new extractor."""
-        mock_client.execute_write.return_value = [
-            {
-                "ex": {
-                    "id": str(uuid4()),
-                    "name": "GLiNEREntityExtractor",
-                    "version": "1.0.0",
-                }
-            }
-        ]
+        extractor_id = str(uuid4())
+        mock_client.upsert_node.return_value = {
+            "id": extractor_id,
+            "name": "GLiNEREntityExtractor",
+            "version": "1.0.0",
+        }
 
         result = await long_term_memory.register_extractor(
             "GLiNEREntityExtractor",
@@ -71,12 +75,16 @@ class TestRegisterExtractor:
 
         assert result["name"] == "GLiNEREntityExtractor"
         assert result["version"] == "1.0.0"
-        mock_client.execute_write.assert_called_once()
+        mock_client.upsert_node.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_register_extractor_minimal(self, long_term_memory, mock_client):
         """Test registering extractor with minimal info."""
-        mock_client.execute_write.return_value = [{}]
+        mock_client.upsert_node.return_value = {
+            "id": str(uuid4()),
+            "name": "SpacyNER",
+            "version": None,
+        }
 
         result = await long_term_memory.register_extractor("SpacyNER")
 
@@ -90,7 +98,7 @@ class TestLinkEntityToMessage:
     @pytest.mark.asyncio
     async def test_link_entity_to_message(self, long_term_memory, mock_client, sample_entity):
         """Test linking entity to source message."""
-        mock_client.execute_write.return_value = [{"r": {"confidence": 0.9}}]
+        mock_client.link_nodes.return_value = {"confidence": 0.9}
         message_id = uuid4()
 
         result = await long_term_memory.link_entity_to_message(
@@ -103,18 +111,23 @@ class TestLinkEntityToMessage:
         )
 
         assert result is True
-        mock_client.execute_write.assert_called_once()
-        call_args = mock_client.execute_write.call_args[0][1]
-        assert call_args["entity_id"] == str(sample_entity.id)
-        assert call_args["message_id"] == str(message_id)
-        assert call_args["confidence"] == 0.9
-        assert call_args["start_pos"] == 10
-        assert call_args["end_pos"] == 20
+        mock_client.link_nodes.assert_called_once()
+        # Verify the arguments passed to link_nodes
+        call_kwargs = mock_client.link_nodes.call_args
+        assert call_kwargs[0][0] == "Entity"  # source_label
+        assert call_kwargs[0][1] == str(sample_entity.id)  # source_id
+        assert call_kwargs[0][2] == "Message"  # target_label
+        assert call_kwargs[0][3] == str(message_id)  # target_id
+        assert call_kwargs[0][4] == "EXTRACTED_FROM"  # relationship_type
+        props = call_kwargs[1]["properties"]
+        assert props["confidence"] == 0.9
+        assert props["start_pos"] == 10
+        assert props["end_pos"] == 20
 
     @pytest.mark.asyncio
     async def test_link_entity_by_uuid(self, long_term_memory, mock_client):
         """Test linking entity using UUID directly."""
-        mock_client.execute_write.return_value = [{"r": {}}]
+        mock_client.link_nodes.return_value = {}
         entity_id = uuid4()
         message_id = uuid4()
 
@@ -124,8 +137,8 @@ class TestLinkEntityToMessage:
         )
 
         assert result is True
-        call_args = mock_client.execute_write.call_args[0][1]
-        assert call_args["entity_id"] == str(entity_id)
+        call_kwargs = mock_client.link_nodes.call_args
+        assert call_kwargs[0][1] == str(entity_id)
 
 
 class TestLinkEntityToExtractor:
@@ -134,11 +147,17 @@ class TestLinkEntityToExtractor:
     @pytest.mark.asyncio
     async def test_link_entity_to_extractor(self, long_term_memory, mock_client, sample_entity):
         """Test linking entity to extractor."""
-        # First call registers extractor, second creates link
-        mock_client.execute_write.side_effect = [
-            [{"ex": {"name": "GLiNER"}}],  # register_extractor
-            [{"r": {}}],  # create link
-        ]
+        extractor_id = str(uuid4())
+        # upsert_node is called by register_extractor
+        mock_client.upsert_node.return_value = {
+            "id": extractor_id,
+            "name": "GLiNER",
+            "version": None,
+        }
+        # get_node is called to find the extractor by name
+        mock_client.get_node.return_value = {"id": extractor_id, "name": "GLiNER"}
+        # link_nodes creates the EXTRACTED_BY link
+        mock_client.link_nodes.return_value = {}
 
         result = await long_term_memory.link_entity_to_extractor(
             sample_entity,
@@ -148,15 +167,22 @@ class TestLinkEntityToExtractor:
         )
 
         assert result is True
-        assert mock_client.execute_write.call_count == 2
+        # upsert_node called once (register_extractor)
+        mock_client.upsert_node.assert_called_once()
+        # link_nodes called once (EXTRACTED_BY)
+        mock_client.link_nodes.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_link_entity_by_uuid_to_extractor(self, long_term_memory, mock_client):
         """Test linking entity using UUID."""
-        mock_client.execute_write.side_effect = [
-            [{"ex": {}}],  # register
-            [{"r": {}}],  # link
-        ]
+        extractor_id = str(uuid4())
+        mock_client.upsert_node.return_value = {
+            "id": extractor_id,
+            "name": "SpacyNER",
+            "version": None,
+        }
+        mock_client.get_node.return_value = {"id": extractor_id, "name": "SpacyNER"}
+        mock_client.link_nodes.return_value = {}
         entity_id = uuid4()
 
         result = await long_term_memory.link_entity_to_extractor(
@@ -173,17 +199,19 @@ class TestGetEntityProvenance:
     @pytest.mark.asyncio
     async def test_get_provenance_with_sources(self, long_term_memory, mock_client, sample_entity):
         """Test getting provenance with message sources."""
-        mock_client.execute_read.return_value = [
-            {
-                "e": {"id": str(sample_entity.id), "name": "John"},
-                "sources": [
-                    {
-                        "message": {"id": str(uuid4()), "content": "John works at Acme"},
-                        "relationship": {"confidence": 0.9, "start_pos": 0, "end_pos": 4},
-                    }
-                ],
-                "extractors": [],
-            }
+        msg_id = str(uuid4())
+        # traverse is called twice: once for EXTRACTED_FROM, once for EXTRACTED_BY
+        mock_client.traverse.side_effect = [
+            # First call: EXTRACTED_FROM → Messages
+            [
+                {
+                    "id": msg_id,
+                    "content": "John works at Acme",
+                    "_edge": {"confidence": 0.9, "start_pos": 0, "end_pos": 4},
+                }
+            ],
+            # Second call: EXTRACTED_BY → Extractors
+            [],
         ]
 
         result = await long_term_memory.get_entity_provenance(sample_entity)
@@ -198,17 +226,18 @@ class TestGetEntityProvenance:
         self, long_term_memory, mock_client, sample_entity
     ):
         """Test getting provenance with extractor info."""
-        mock_client.execute_read.return_value = [
-            {
-                "e": {"id": str(sample_entity.id)},
-                "sources": [],
-                "extractors": [
-                    {
-                        "extractor": {"name": "GLiNER", "version": "1.0"},
-                        "relationship": {"confidence": 0.85, "extraction_time_ms": 100},
-                    }
-                ],
-            }
+        mock_client.traverse.side_effect = [
+            # First call: EXTRACTED_FROM → Messages
+            [],
+            # Second call: EXTRACTED_BY → Extractors
+            [
+                {
+                    "id": str(uuid4()),
+                    "name": "GLiNER",
+                    "version": "1.0",
+                    "_edge": {"confidence": 0.85, "extraction_time_ms": 100},
+                }
+            ],
         ]
 
         result = await long_term_memory.get_entity_provenance(sample_entity)
@@ -221,7 +250,10 @@ class TestGetEntityProvenance:
     @pytest.mark.asyncio
     async def test_get_provenance_no_results(self, long_term_memory, mock_client, sample_entity):
         """Test getting provenance when none exists."""
-        mock_client.execute_read.return_value = []
+        mock_client.traverse.side_effect = [
+            [],  # EXTRACTED_FROM
+            [],  # EXTRACTED_BY
+        ]
 
         result = await long_term_memory.get_entity_provenance(sample_entity)
 
@@ -231,12 +263,9 @@ class TestGetEntityProvenance:
     async def test_get_provenance_by_uuid(self, long_term_memory, mock_client):
         """Test getting provenance using UUID directly."""
         entity_id = uuid4()
-        mock_client.execute_read.return_value = [
-            {
-                "e": {"id": str(entity_id)},
-                "sources": [],
-                "extractors": [],
-            }
+        mock_client.traverse.side_effect = [
+            [],  # EXTRACTED_FROM
+            [],  # EXTRACTED_BY
         ]
 
         result = await long_term_memory.get_entity_provenance(entity_id)
@@ -251,24 +280,22 @@ class TestGetEntitiesFromMessage:
     async def test_get_entities_from_message(self, long_term_memory, mock_client):
         """Test getting entities extracted from a message."""
         message_id = uuid4()
-        mock_client.execute_read.return_value = [
+        entity1_id = str(uuid4())
+        entity2_id = str(uuid4())
+        mock_client.traverse.return_value = [
             {
-                "e": {
-                    "id": str(uuid4()),
-                    "name": "John",
-                    "type": "PERSON",
-                    "confidence": 0.9,
-                },
-                "r": {"confidence": 0.9, "start_pos": 0, "end_pos": 4},
+                "id": entity1_id,
+                "name": "John",
+                "type": "PERSON",
+                "confidence": 0.9,
+                "_edge": {"confidence": 0.9, "start_pos": 0, "end_pos": 4},
             },
             {
-                "e": {
-                    "id": str(uuid4()),
-                    "name": "Acme",
-                    "type": "ORGANIZATION",
-                    "confidence": 0.85,
-                },
-                "r": {"confidence": 0.85, "start_pos": 15, "end_pos": 19},
+                "id": entity2_id,
+                "name": "Acme",
+                "type": "ORGANIZATION",
+                "confidence": 0.85,
+                "_edge": {"confidence": 0.85, "start_pos": 15, "end_pos": 19},
             },
         ]
 
@@ -283,7 +310,7 @@ class TestGetEntitiesFromMessage:
     @pytest.mark.asyncio
     async def test_get_entities_from_message_empty(self, long_term_memory, mock_client):
         """Test getting entities when none exist."""
-        mock_client.execute_read.return_value = []
+        mock_client.traverse.return_value = []
 
         result = await long_term_memory.get_entities_from_message(uuid4())
 
@@ -296,15 +323,15 @@ class TestGetEntitiesByExtractor:
     @pytest.mark.asyncio
     async def test_get_entities_by_extractor(self, long_term_memory, mock_client):
         """Test getting entities by extractor name."""
-        mock_client.execute_read.return_value = [
+        extractor_id = str(uuid4())
+        mock_client.get_node.return_value = {"id": extractor_id, "name": "GLiNER"}
+        mock_client.traverse.return_value = [
             {
-                "e": {
-                    "id": str(uuid4()),
-                    "name": "John",
-                    "type": "PERSON",
-                    "confidence": 0.9,
-                },
-                "r": {"confidence": 0.9, "extraction_time_ms": 50.0},
+                "id": str(uuid4()),
+                "name": "John",
+                "type": "PERSON",
+                "confidence": 0.9,
+                "_edge": {"confidence": 0.9, "extraction_time_ms": 50.0},
             },
         ]
 
@@ -317,12 +344,16 @@ class TestGetEntitiesByExtractor:
     @pytest.mark.asyncio
     async def test_get_entities_by_extractor_with_limit(self, long_term_memory, mock_client):
         """Test limit parameter is passed correctly."""
-        mock_client.execute_read.return_value = []
+        extractor_id = str(uuid4())
+        mock_client.get_node.return_value = {"id": extractor_id, "name": "SpacyNER"}
+        mock_client.traverse.return_value = []
 
         await long_term_memory.get_entities_by_extractor("SpacyNER", limit=25)
 
-        call_args = mock_client.execute_read.call_args[0][1]
-        assert call_args["limit"] == 25
+        # Verify traverse was called with the correct limit
+        mock_client.traverse.assert_called_once()
+        call_kwargs = mock_client.traverse.call_args[1]
+        assert call_kwargs["limit"] == 25
 
 
 class TestListExtractors:
@@ -331,9 +362,16 @@ class TestListExtractors:
     @pytest.mark.asyncio
     async def test_list_extractors(self, long_term_memory, mock_client):
         """Test listing all extractors."""
-        mock_client.execute_read.return_value = [
-            {"ex": {"name": "GLiNER", "version": "1.0"}, "entity_count": 100},
-            {"ex": {"name": "SpacyNER", "version": "3.7"}, "entity_count": 50},
+        ex1_id = str(uuid4())
+        ex2_id = str(uuid4())
+        mock_client.query_nodes.return_value = [
+            {"id": ex1_id, "name": "GLiNER", "version": "1.0"},
+            {"id": ex2_id, "name": "SpacyNER", "version": "3.7"},
+        ]
+        # traverse is called for each extractor to count entities
+        mock_client.traverse.side_effect = [
+            [{"id": str(uuid4())} for _ in range(100)],  # 100 entities for GLiNER
+            [{"id": str(uuid4())} for _ in range(50)],   # 50 entities for SpacyNER
         ]
 
         result = await long_term_memory.list_extractors()
@@ -346,7 +384,7 @@ class TestListExtractors:
     @pytest.mark.asyncio
     async def test_list_extractors_empty(self, long_term_memory, mock_client):
         """Test listing when no extractors exist."""
-        mock_client.execute_read.return_value = []
+        mock_client.query_nodes.return_value = []
 
         result = await long_term_memory.list_extractors()
 
@@ -359,24 +397,40 @@ class TestGetExtractionStats:
     @pytest.mark.asyncio
     async def test_get_extraction_stats(self, long_term_memory, mock_client):
         """Test getting overall extraction stats."""
-        mock_client.execute_read.return_value = [
-            {
-                "total_entities": 500,
-                "source_messages": 100,
-                "extractors": ["GLiNER", "SpacyNER"],
-            }
+        mock_client.count_nodes.return_value = 500
+
+        mock_client.query_nodes.side_effect = [
+            # First call: query_nodes("Extractor")
+            [{"name": "GLiNER"}, {"name": "SpacyNER"}],
+            # Second call: query_nodes("Entity", limit=10000)
+            [
+                {"id": str(uuid4()), "name": "E1", "type": "PERSON"},
+                {"id": str(uuid4()), "name": "E2", "type": "PERSON"},
+            ],
+        ]
+
+        # For each entity, traverse to find source messages
+        msg_id_1 = str(uuid4())
+        msg_id_2 = str(uuid4())
+        mock_client.traverse.side_effect = [
+            [{"id": msg_id_1}],  # entity 1 sources
+            [{"id": msg_id_2}],  # entity 2 sources
         ]
 
         result = await long_term_memory.get_extraction_stats()
 
         assert result["total_entities"] == 500
-        assert result["source_messages"] == 100
+        assert result["source_messages"] == 2
         assert "GLiNER" in result["extractors"]
 
     @pytest.mark.asyncio
     async def test_get_extraction_stats_empty(self, long_term_memory, mock_client):
         """Test stats when no data exists."""
-        mock_client.execute_read.return_value = []
+        mock_client.count_nodes.return_value = 0
+        mock_client.query_nodes.side_effect = [
+            [],  # Extractor query
+            [],  # Entity query
+        ]
 
         result = await long_term_memory.get_extraction_stats()
 
@@ -391,19 +445,24 @@ class TestGetExtractorStats:
     @pytest.mark.asyncio
     async def test_get_extractor_stats(self, long_term_memory, mock_client):
         """Test getting per-extractor stats."""
-        mock_client.execute_read.return_value = [
-            {
-                "name": "GLiNER",
-                "version": "1.0",
-                "entity_count": 100,
-                "avg_confidence": 0.85,
-            },
-            {
-                "name": "SpacyNER",
-                "version": "3.7",
-                "entity_count": 50,
-                "avg_confidence": 0.75,
-            },
+        ex1_id = str(uuid4())
+        ex2_id = str(uuid4())
+        mock_client.query_nodes.return_value = [
+            {"id": ex1_id, "name": "GLiNER", "version": "1.0"},
+            {"id": ex2_id, "name": "SpacyNER", "version": "3.7"},
+        ]
+        # traverse for each extractor to get entities with edge data
+        mock_client.traverse.side_effect = [
+            # GLiNER: 100 entities with avg confidence 0.85
+            [
+                {"id": str(uuid4()), "name": f"E{i}", "type": "PERSON", "_edge": {"confidence": 0.85}}
+                for i in range(100)
+            ],
+            # SpacyNER: 50 entities with avg confidence 0.75
+            [
+                {"id": str(uuid4()), "name": f"E{i}", "type": "PERSON", "_edge": {"confidence": 0.75}}
+                for i in range(50)
+            ],
         ]
 
         result = await long_term_memory.get_extractor_stats()
@@ -411,7 +470,7 @@ class TestGetExtractorStats:
         assert len(result) == 2
         assert result[0]["name"] == "GLiNER"
         assert result[0]["entity_count"] == 100
-        assert result[0]["avg_confidence"] == 0.85
+        assert abs(result[0]["avg_confidence"] - 0.85) < 1e-10
 
 
 class TestDeleteEntityProvenance:
@@ -420,7 +479,15 @@ class TestDeleteEntityProvenance:
     @pytest.mark.asyncio
     async def test_delete_provenance(self, long_term_memory, mock_client, sample_entity):
         """Test deleting provenance for an entity."""
-        mock_client.execute_write.return_value = [{"deleted": 3}]
+        msg_id_1 = str(uuid4())
+        msg_id_2 = str(uuid4())
+        ext_id = str(uuid4())
+        # traverse EXTRACTED_FROM, then traverse EXTRACTED_BY
+        mock_client.traverse.side_effect = [
+            [{"id": msg_id_1}, {"id": msg_id_2}],  # 2 source messages
+            [{"id": ext_id}],                        # 1 extractor
+        ]
+        mock_client.unlink_nodes.return_value = True
 
         result = await long_term_memory.delete_entity_provenance(sample_entity)
 
@@ -429,7 +496,10 @@ class TestDeleteEntityProvenance:
     @pytest.mark.asyncio
     async def test_delete_provenance_none(self, long_term_memory, mock_client, sample_entity):
         """Test deleting when no provenance exists."""
-        mock_client.execute_write.return_value = [{"deleted": 0}]
+        mock_client.traverse.side_effect = [
+            [],  # no source messages
+            [],  # no extractors
+        ]
 
         result = await long_term_memory.delete_entity_provenance(sample_entity)
 
@@ -439,13 +509,21 @@ class TestDeleteEntityProvenance:
     async def test_delete_provenance_by_uuid(self, long_term_memory, mock_client):
         """Test deleting provenance using UUID."""
         entity_id = uuid4()
-        mock_client.execute_write.return_value = [{"deleted": 2}]
+        msg_id = str(uuid4())
+        ext_id = str(uuid4())
+        mock_client.traverse.side_effect = [
+            [{"id": msg_id}],   # 1 source message
+            [{"id": ext_id}],   # 1 extractor
+        ]
+        mock_client.unlink_nodes.return_value = True
 
         result = await long_term_memory.delete_entity_provenance(entity_id)
 
         assert result == 2
-        call_args = mock_client.execute_write.call_args[0][1]
-        assert call_args["entity_id"] == str(entity_id)
+        # Verify unlink_nodes was called with correct entity_id
+        calls = mock_client.unlink_nodes.call_args_list
+        assert calls[0][0][1] == str(entity_id)
+        assert calls[1][0][1] == str(entity_id)
 
 
 class TestProvenanceEdgeCases:
@@ -456,17 +534,18 @@ class TestProvenanceEdgeCases:
         self, long_term_memory, mock_client, sample_entity
     ):
         """Test provenance parsing when relationship is a dict."""
-        mock_client.execute_read.return_value = [
-            {
-                "e": {"id": str(sample_entity.id)},
-                "sources": [
-                    {
-                        "message": {"id": str(uuid4()), "content": "Test"},
-                        "relationship": {"confidence": 0.8},  # Plain dict
-                    }
-                ],
-                "extractors": [],
-            }
+        msg_id = str(uuid4())
+        mock_client.traverse.side_effect = [
+            # EXTRACTED_FROM with edge data
+            [
+                {
+                    "id": msg_id,
+                    "content": "Test",
+                    "_edge": {"confidence": 0.8},
+                }
+            ],
+            # EXTRACTED_BY
+            [],
         ]
 
         result = await long_term_memory.get_entity_provenance(sample_entity)
@@ -477,7 +556,10 @@ class TestProvenanceEdgeCases:
     @pytest.mark.asyncio
     async def test_empty_result_handling(self, long_term_memory, mock_client):
         """Test handling of empty results."""
-        mock_client.execute_write.return_value = []
+        mock_client.traverse.side_effect = [
+            [],  # no source messages
+            [],  # no extractors
+        ]
 
         result = await long_term_memory.delete_entity_provenance(uuid4())
 
@@ -486,7 +568,7 @@ class TestProvenanceEdgeCases:
     @pytest.mark.asyncio
     async def test_link_with_string_message_id(self, long_term_memory, mock_client, sample_entity):
         """Test linking with string message ID."""
-        mock_client.execute_write.return_value = [{"r": {}}]
+        mock_client.link_nodes.return_value = {}
         message_id = str(uuid4())
 
         result = await long_term_memory.link_entity_to_message(

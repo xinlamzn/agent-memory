@@ -195,11 +195,12 @@ class TestGraphStatsResource:
     async def test_returns_stats(self):
         """Graph stats resource returns node counts."""
         mock_client = make_mock_client()
-        mock_client.graph.execute_read = AsyncMock(
-            return_value=[
-                {"labels": ["Entity"], "count": 42},
-                {"labels": ["Message"], "count": 100},
-            ]
+        mock_client.backend.utility.get_stats = AsyncMock(
+            return_value={
+                "backend": "neo4j",
+                "by_namespace": {"short_term": 100, "long_term": 42},
+                "by_labels": {"Entity": 42, "Message": 100},
+            }
         )
 
         server = create_resource_server(mock_client)
@@ -208,13 +209,13 @@ class TestGraphStatsResource:
 
         data = json.loads(result[0].text)
         assert "stats" in data
-        assert len(data["stats"]) == 2
+        assert "by_labels" in data["stats"]
 
     @pytest.mark.asyncio
     async def test_handles_error_gracefully(self):
         """Graph stats resource handles errors without crashing."""
         mock_client = make_mock_client()
-        mock_client.graph.execute_read = AsyncMock(side_effect=Exception("Connection lost"))
+        mock_client.backend.utility.get_stats = AsyncMock(side_effect=Exception("Connection lost"))
 
         server = create_resource_server(mock_client)
         async with Client(server) as client:

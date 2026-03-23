@@ -24,6 +24,11 @@ def make_mock_client() -> MagicMock:
     client.long_term = MagicMock()
     client.reasoning = MagicMock()
     client.graph = MagicMock()
+    client.backend = MagicMock()
+    client.backend.graph = MagicMock()
+    client.backend.utility = MagicMock()
+    client.capabilities = MagicMock()
+    client.capabilities.supports_raw_query = True
     return client
 
 

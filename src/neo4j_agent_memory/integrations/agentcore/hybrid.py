@@ -369,27 +369,26 @@ class HybridMemoryProvider(Neo4jMemoryProvider):
                 entity_name = memory.metadata.get("display_name", "")
                 if entity_name:
                     try:
-                        rel_query = """
-                        MATCH (e:Entity {displayName: $name})-[r]-(other:Entity)
-                        RETURN type(r) AS relationship,
-                               other.displayName AS related_entity,
-                               other.type AS related_type
-                        LIMIT $limit
-                        """
-                        relationships = await self._client._client.execute_read(
-                            rel_query,
-                            {"name": entity_name, "limit": self._relationship_depth * 5},
-                        )
-
-                        if relationships:
-                            memory.metadata["relationships"] = [
-                                {
-                                    "type": r["relationship"],
-                                    "entity": r["related_entity"],
-                                    "entity_type": r["related_type"],
-                                }
-                                for r in relationships
-                            ]
+                        entity_id = memory.metadata.get("id", "")
+                        if entity_id:
+                            traversal = await self._client.backend.graph.traverse(
+                                start_label="Entity",
+                                start_id=entity_id,
+                                direction="both",
+                                depth=1,
+                                include_edges=True,
+                                limit=self._relationship_depth * 5,
+                            )
+                            if traversal:
+                                memory.metadata["relationships"] = [
+                                    {
+                                        "type": n.get("_edge", {}).get("type", "RELATED_TO"),
+                                        "entity": n.get("displayName", n.get("name", "")),
+                                        "entity_type": n.get("type", ""),
+                                    }
+                                    for n in traversal
+                                    if n.get("id")
+                                ]
                     except Exception as e:
                         logger.debug(f"Failed to get relationships: {e}")
 
@@ -463,70 +462,57 @@ class HybridMemoryProvider(Neo4jMemoryProvider):
         """
         effective_depth = depth or self._relationship_depth
 
-        # Build relationship type filter
-        rel_filter = ""
-        params: dict[str, Any] = {
-            "name": entity_name,
-            "depth": effective_depth,
-        }
-
-        if relationship_types:
-            rel_types = "|".join(relationship_types)
-            rel_filter = f":{rel_types}"
-
-        query = f"""
-        MATCH (e:Entity)
-        WHERE e.displayName = $name OR $name IN e.aliases
-        OPTIONAL MATCH path = (e)-[r{rel_filter}*1..{effective_depth}]-(connected:Entity)
-        WITH e, connected, relationships(path) AS rels
-        UNWIND CASE WHEN rels IS NULL THEN [null] ELSE rels END AS rel
-        WITH e, connected,
-             CASE WHEN rel IS NOT NULL THEN startNode(rel) END AS from_node,
-             CASE WHEN rel IS NOT NULL THEN endNode(rel) END AS to_node,
-             CASE WHEN rel IS NOT NULL THEN type(rel) END AS rel_type
-        RETURN DISTINCT
-            e.displayName AS entity_name,
-            e.type AS entity_type,
-            e.description AS entity_description,
-            from_node.displayName AS from_entity,
-            rel_type AS relationship,
-            to_node.displayName AS to_entity
-        LIMIT 50
-        """
-
         try:
-            records = await self._client._client.execute_read(query, params)
-
-            if not records:
+            # First find the entity by name to get its ID.
+            entities = await self._client.long_term.search_entities(
+                query=entity_name,
+                limit=1,
+            )
+            if not entities:
                 return {"found": False, "entity_name": entity_name}
 
-            # Build result structure
-            first = records[0]
+            entity = entities[0]
+            entity_id = str(entity.id)
+
+            # Traverse relationships using the backend-neutral API.
+            traversal = await self._client.backend.graph.traverse(
+                start_label="Entity",
+                start_id=entity_id,
+                relationship_types=relationship_types,
+                direction="both",
+                depth=effective_depth,
+                include_edges=True,
+                limit=50,
+            )
+
             result: dict[str, Any] = {
                 "found": True,
                 "entity": {
-                    "name": first["entity_name"],
-                    "type": first["entity_type"],
-                    "description": first["entity_description"],
+                    "name": entity.display_name,
+                    "type": (
+                        entity.type.value
+                        if hasattr(entity.type, "value")
+                        else str(entity.type)
+                    ),
+                    "description": entity.description,
                 },
                 "relationships": [],
             }
 
             seen_rels: set[tuple[str, str, str]] = set()
-            for record in records:
-                if record["relationship"]:
-                    rel_key = (
-                        record["from_entity"] or "",
-                        record["relationship"],
-                        record["to_entity"] or "",
-                    )
+            for n in traversal:
+                edge = n.get("_edge", {})
+                rel_type = edge.get("type", "RELATED_TO")
+                to_name = n.get("displayName", n.get("name", ""))
+                if to_name:
+                    rel_key = (entity.display_name, rel_type, to_name)
                     if rel_key not in seen_rels:
                         seen_rels.add(rel_key)
                         result["relationships"].append(
                             {
-                                "from": record["from_entity"],
-                                "type": record["relationship"],
-                                "to": record["to_entity"],
+                                "from": entity.display_name,
+                                "type": rel_type,
+                                "to": to_name,
                             }
                         )
 

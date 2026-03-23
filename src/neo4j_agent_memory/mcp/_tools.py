@@ -360,6 +360,16 @@ def register_tools(mcp: FastMCP) -> None:
         CALL apoc.*) are allowed. Write operations (CREATE, MERGE, DELETE,
         SET, REMOVE) are blocked for safety.
         """
+        client = get_client(ctx)
+
+        if not client.capabilities.supports_raw_query:
+            return json.dumps(
+                {
+                    "error": "Raw Cypher queries are only available with the Neo4j backend. "
+                    "The current backend does not support raw query execution."
+                }
+            )
+
         if not _is_read_only_query(query):
             return json.dumps(
                 {
@@ -367,8 +377,6 @@ def register_tools(mcp: FastMCP) -> None:
                     "Write operations (CREATE, MERGE, DELETE, SET, REMOVE) are not permitted."
                 }
             )
-
-        client = get_client(ctx)
 
         try:
             records = await client.graph.execute_read(query, parameters or {})
@@ -463,6 +471,9 @@ async def _get_entity_neighbors(
 ) -> list[dict[str, Any]]:
     """Get neighboring entities via graph traversal.
 
+    Uses the backend-neutral ``traverse()`` API instead of raw Cypher,
+    so it works with both Neo4j and Memory Store backends.
+
     Args:
         client: MemoryClient instance.
         entity_id: Starting entity ID.
@@ -472,31 +483,32 @@ async def _get_entity_neighbors(
         List of neighboring entities with relationships.
     """
     max_hops = min(max(max_hops, 1), 3)
-    query = f"""
-    MATCH (e:Entity {{id: $entity_id}})-[r*1..{max_hops}]-(neighbor:Entity)
-    WHERE neighbor.id <> $entity_id
-    WITH DISTINCT neighbor, r
-    RETURN neighbor.id AS id,
-           neighbor.name AS name,
-           neighbor.type AS type,
-           neighbor.description AS description
-    LIMIT 20
-    """
 
     try:
-        records = await client.graph.execute_read(
-            query,
-            {"entity_id": entity_id},
+        neighbors = await client.backend.graph.traverse(
+            start_label="Entity",
+            start_id=entity_id,
+            relationship_types=None,
+            direction="both",
+            depth=max_hops,
+            include_edges=True,
+            limit=20,
         )
-        return [
-            {
-                "id": r["id"],
-                "name": r["name"],
-                "type": r["type"],
-                "description": r["description"],
-            }
-            for r in records
-        ]
+        results: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for n in neighbors:
+            nid = n.get("id", "")
+            if nid and nid != entity_id and nid not in seen_ids:
+                seen_ids.add(nid)
+                results.append(
+                    {
+                        "id": nid,
+                        "name": n.get("name", n.get("displayName", "")),
+                        "type": n.get("type", ""),
+                        "description": n.get("description", ""),
+                    }
+                )
+        return results
     except Exception as e:
         logger.debug(f"Error getting neighbors: {e}")
         return []
