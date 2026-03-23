@@ -360,6 +360,8 @@ class MemoryStoreGraphBackend:
 
         return None
 
+    _QUERY_MAX_TOP_K = 10_000  # Memory Store hard cap per request
+
     async def query_nodes(
         self,
         label: str,
@@ -370,37 +372,71 @@ class MemoryStoreGraphBackend:
         limit: int | None = None,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """Query multiple nodes with optional filtering via ``_query`` enumerate."""
-        body: dict[str, Any] = {
-            **self._scope(label),
-            "labels": [label],
-            "top_k": limit or 100,
-        }
+        """Query multiple nodes with optional filtering via ``_query`` enumerate.
 
-        result = await self._post("_query", body)
-        if not result:
-            return []
+        When *limit* exceeds the per-request cap (10 000) the method
+        automatically paginates using the ``search_after`` cursor returned
+        by the Memory Store API.
+        """
+        effective_limit = limit or 100
+        page_size = min(effective_limit, self._QUERY_MAX_TOP_K)
 
-        hits = result.get("hits", [])
-        parsed = [self._parse_query_hit(h) for h in hits]
+        all_parsed: list[dict[str, Any]] = []
+        search_after: list | None = None
+
+        while len(all_parsed) < effective_limit:
+            remaining = effective_limit - len(all_parsed)
+            current_page = min(remaining, page_size)
+
+            body: dict[str, Any] = {
+                **self._scope(label),
+                "labels": [label],
+                "top_k": current_page,
+            }
+            if search_after is not None:
+                body["search_after"] = search_after
+
+            result = await self._post("_query", body)
+            if not result:
+                break
+
+            hits = result.get("hits", [])
+            if not hits:
+                break
+
+            all_parsed.extend(self._parse_query_hit(h) for h in hits)
+
+            # If fewer hits than requested, we've exhausted results.
+            if len(hits) < current_page:
+                break
+
+            # Advance the cursor for the next page.
+            next_cursor = result.get("next_search_after")
+            if not next_cursor:
+                # Fall back to the ``sort`` field on the last hit.
+                last_sort = hits[-1].get("sort")
+                if not last_sort:
+                    break
+                next_cursor = last_sort
+            search_after = next_cursor
 
         # Apply property filters client-side (the query API does not support
         # arbitrary property filters).
         if filters:
-            parsed = [
-                p for p in parsed
+            all_parsed = [
+                p for p in all_parsed
                 if all(p.get(k) == v for k, v in filters.items())
             ]
 
         # Apply offset client-side.
         if offset > 0:
-            parsed = parsed[offset:]
+            all_parsed = all_parsed[offset:]
 
         # Strip _score from enumerate results.
-        for p in parsed:
+        for p in all_parsed:
             p.pop("_score", None)
 
-        return parsed
+        return all_parsed
 
     async def update_node(
         self,

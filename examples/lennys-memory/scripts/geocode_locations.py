@@ -146,10 +146,10 @@ async def main():
 
         print()
         print("Geocoding complete!")
-        print(f"  Processed: {stats['processed']} locations")
-        print(f"  Geocoded:  {stats['geocoded']} locations")
-        print(f"  Skipped:   {stats['skipped']} locations")
-        print(f"  Failed:    {stats['failed']} locations")
+        print(f"  Processed: {stats.get('processed', 0)} locations")
+        print(f"  Geocoded:  {stats.get('geocoded', 0)} locations")
+        print(f"  Skipped:   {stats.get('skipped', 0)} locations")
+        print(f"  Failed:    {stats.get('failed', 0)} locations")
 
         if stats["geocoded"] > 0:
             print()

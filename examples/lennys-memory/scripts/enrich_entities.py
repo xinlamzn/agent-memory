@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Enrich entities with Wikipedia data.
 
-This script enriches Entity nodes in Neo4j with data from Wikipedia/Wikimedia:
+This script enriches Entity nodes in Memory Store with data from Wikipedia/Wikimedia:
 - Description/summary from Wikipedia
 - Wikipedia URL
 - Wikidata ID
 - Thumbnail image URL
 
 Features:
+- Uses Memory Store API (query_nodes, update_node) for data access
 - Real-time progress bars with ETA
 - Configurable rate limiting (respects Wikimedia ToS)
 - Skip already-enriched entities
+- Deduplicates by entity name (enrich once per unique name)
 - Filter by entity type
 - Detailed statistics on completion
 """
@@ -154,126 +156,204 @@ def print_progress(
     print(status, end="", flush=True)
 
 
-async def get_unenriched_entities(
-    client: MemoryClient,
+def _get_graph_backend(client: MemoryClient):
+    """Access the graph backend from a MemoryClient."""
+    return client._bundle.graph
+
+
+async def get_all_entities(client: MemoryClient) -> list[dict]:
+    """Load all Entity nodes from Memory Store via query_nodes.
+
+    The Memory Store API caps top_k at 10,000. To get all entities we
+    query in batches by entity type.
+
+    Returns:
+        List of entity dicts with id, name, type, and any enrichment properties.
+    """
+    graph = _get_graph_backend(client)
+
+    # First try a single large query (works if <=10K entities)
+    entities = await graph.query_nodes("Entity", limit=10000)
+
+    if len(entities) < 10000:
+        return entities
+
+    # If we hit the cap, query by entity type to get them all
+    logger.info("Hit 10K cap, loading entities by type...")
+    seen_ids: set[str] = set()
+    all_entities: list[dict] = []
+
+    entity_types = ["PERSON", "ORGANIZATION", "LOCATION", "OBJECT", "EVENT",
+                    "CONCEPT", "PRODUCT", "TECHNOLOGY", "WORK_OF_ART"]
+
+    for etype in entity_types:
+        batch = await graph.query_nodes("Entity", filters={"type": etype}, limit=10000)
+        for e in batch:
+            eid = e.get("id", "")
+            if eid not in seen_ids:
+                seen_ids.add(eid)
+                all_entities.append(e)
+        if batch:
+            logger.info(f"  {etype}: {len(batch)} entities")
+
+    # Also grab any entities without a type or with unusual types
+    remaining = await graph.query_nodes("Entity", limit=10000)
+    for e in remaining:
+        eid = e.get("id", "")
+        if eid not in seen_ids:
+            seen_ids.add(eid)
+            all_entities.append(e)
+
+    return all_entities
+
+
+def filter_unenriched_entities(
+    all_entities: list[dict],
     entity_types: list[str] | None = None,
     limit: int | None = None,
 ) -> list[dict]:
-    """Get entities that haven't been enriched yet.
+    """Filter entities that haven't been enriched yet.
 
     Args:
-        client: Memory client
+        all_entities: Pre-loaded list of all entities
         entity_types: Filter by entity types (e.g., ["PERSON", "ORGANIZATION"])
         limit: Maximum number of entities to return
 
     Returns:
-        List of entity dicts with id, name, type
+        List of entity dicts with id, name, type (deduplicated by name)
     """
-    # Build query
-    type_filter = ""
-    if entity_types:
-        types_str = ", ".join(f"'{t.upper()}'" for t in entity_types)
-        type_filter = f"AND e.type IN [{types_str}]"
+    # Filter for unenriched entities
+    unenriched = []
+    for e in all_entities:
+        if e.get("enriched_description") or e.get("enrichment_error"):
+            continue
+        if entity_types:
+            if e.get("type", "").upper() not in [t.upper() for t in entity_types]:
+                continue
+        unenriched.append(e)
 
-    limit_clause = f"LIMIT {limit}" if limit else ""
+    # Deduplicate by name - keep first occurrence per unique name
+    seen_names: set[str] = set()
+    deduped = []
+    for e in sorted(unenriched, key=lambda x: x.get("name", "")):
+        name = e.get("name", "").strip().lower()
+        if name and name not in seen_names:
+            seen_names.add(name)
+            deduped.append(e)
 
-    query = f"""
-    MATCH (e:Entity)
-    WHERE e.enriched_description IS NULL
-      AND e.enrichment_error IS NULL
-      {type_filter}
-    RETURN e.id AS id, e.name AS name, e.type AS type, e.description AS description
-    ORDER BY e.name
-    {limit_clause}
-    """
+    if limit:
+        deduped = deduped[:limit]
 
-    result = await client._client.execute_read(query)
-    return [dict(record) for record in result]
+    return deduped
 
 
-async def get_enrichment_status(client: MemoryClient) -> dict:
-    """Get current enrichment status of all entities.
+def compute_enrichment_status(all_entities: list[dict]) -> dict:
+    """Compute enrichment status from a pre-loaded entity list.
 
     Returns:
         Dict with counts: total, enriched, pending, errors
     """
-    query = """
-    MATCH (e:Entity)
-    RETURN
-        count(e) AS total,
-        count(CASE WHEN e.enriched_description IS NOT NULL THEN 1 END) AS enriched,
-        count(CASE WHEN e.enriched_description IS NULL AND e.enrichment_error IS NULL THEN 1 END) AS pending,
-        count(CASE WHEN e.enrichment_error IS NOT NULL THEN 1 END) AS errors
-    """
+    total = len(all_entities)
+    enriched = sum(1 for e in all_entities if e.get("enriched_description"))
+    errors = sum(1 for e in all_entities if e.get("enrichment_error"))
+    pending = total - enriched - errors
 
-    result = await client._client.execute_read(query)
-    record = result[0] if result else {}
     return {
-        "total": record.get("total", 0),
-        "enriched": record.get("enriched", 0),
-        "pending": record.get("pending", 0),
-        "errors": record.get("errors", 0),
+        "total": total,
+        "enriched": enriched,
+        "pending": pending,
+        "errors": errors,
     }
 
 
-async def update_entity_enrichment(
-    client: MemoryClient,
-    entity_id: str,
-    enrichment_data: dict,
+async def _upsert_entity_with_extra_props(
+    graph, entity: dict, extra_props: dict,
 ) -> None:
-    """Update entity with enrichment data.
+    """Re-upsert an entity with additional properties merged in.
 
-    Args:
-        client: Memory client
-        entity_id: Entity UUID
-        enrichment_data: Dict with enrichment fields
+    The Memory Store ``_update`` endpoint's ``set`` field does not persist
+    into the nested ``properties`` object.  ``_upsert`` replaces the full
+    properties dict, so we merge the enrichment data into the existing
+    entity properties and re-upsert.
     """
-    query = """
-    MATCH (e:Entity {id: $id})
-    SET e.enriched_description = $enriched_description,
-        e.wikipedia_url = $wikipedia_url,
-        e.wikidata_id = $wikidata_id,
-        e.image_url = $image_url,
-        e.enriched_at = datetime(),
-        e.enrichment_provider = $provider
-    """
+    # Build merged properties (exclude internal fields)
+    merged = {
+        k: v for k, v in entity.items()
+        if k not in ("_labels", "_score", "embedding")
+    }
+    merged.update(extra_props)
 
-    await client._client.execute_write(query, {
-        "id": entity_id,
+    # Extract embedding if present for kNN indexing
+    embedding = entity.get("embedding") if isinstance(entity.get("embedding"), list) else None
+    if embedding:
+        merged["embedding"] = embedding
+
+    await graph.upsert_node("Entity", id=entity["id"], properties=merged)
+
+
+async def update_entities_by_name(
+    client: MemoryClient,
+    entity_name: str,
+    all_entities: list[dict],
+    enrichment_data: dict,
+) -> int:
+    """Update all entities sharing a name with the same enrichment data.
+
+    Returns:
+        Number of entities updated.
+    """
+    graph = _get_graph_backend(client)
+    from datetime import datetime, timezone
+
+    extra = {
         "enriched_description": enrichment_data.get("description"),
         "wikipedia_url": enrichment_data.get("wikipedia_url"),
         "wikidata_id": enrichment_data.get("wikidata_id"),
         "image_url": enrichment_data.get("image_url"),
-        "provider": "wikimedia",
-    })
+        "enriched_at": datetime.now(timezone.utc).isoformat(),
+        "enrichment_provider": "wikimedia",
+    }
+
+    count = 0
+    name_lower = entity_name.strip().lower()
+    for e in all_entities:
+        if e.get("name", "").strip().lower() == name_lower:
+            await _upsert_entity_with_extra_props(graph, e, extra)
+            count += 1
+    return count
 
 
-async def mark_entity_not_found(
+async def mark_entities_not_found_by_name(
     client: MemoryClient,
-    entity_id: str,
+    entity_name: str,
+    all_entities: list[dict],
     reason: str,
-) -> None:
-    """Mark entity as not found in enrichment source.
+) -> int:
+    """Mark all entities with matching name as not found.
 
-    Args:
-        client: Memory client
-        entity_id: Entity UUID
-        reason: Reason for not finding
+    Returns:
+        Number of entities marked.
     """
-    query = """
-    MATCH (e:Entity {id: $id})
-    SET e.enrichment_error = $reason,
-        e.enrichment_attempted_at = datetime()
-    """
+    graph = _get_graph_backend(client)
+    from datetime import datetime, timezone
 
-    await client._client.execute_write(query, {
-        "id": entity_id,
-        "reason": reason,
-    })
+    extra = {
+        "enrichment_error": reason,
+        "enrichment_attempted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    count = 0
+    name_lower = entity_name.strip().lower()
+    for e in all_entities:
+        if e.get("name", "").strip().lower() == name_lower:
+            await _upsert_entity_with_extra_props(graph, e, extra)
+            count += 1
+    return count
 
 
 async def enrich_entities(
     client: MemoryClient,
+    all_entities: list[dict],
     entity_types: list[str] | None = None,
     limit: int | None = None,
     rate_limit: float = 0.5,
@@ -281,10 +361,15 @@ async def enrich_entities(
 ) -> EnrichmentStats:
     """Enrich entities with Wikipedia data.
 
+    Uses Memory Store API for all data access. Deduplicates by entity name
+    so each unique name is only looked up on Wikipedia once, then all
+    matching nodes are updated.
+
     Args:
         client: Memory client
+        all_entities: Pre-loaded list of all entities
         entity_types: Filter by entity types
-        limit: Maximum entities to process
+        limit: Maximum unique entities to process
         rate_limit: Seconds between API calls (default 0.5 = 2 req/sec)
         dry_run: If True, don't actually update entities
 
@@ -293,21 +378,21 @@ async def enrich_entities(
     """
     stats = EnrichmentStats()
 
-    # Get entities to enrich
-    print(f"\n{color('Fetching entities to enrich...', Colors.CYAN)}")
-    entities = await get_unenriched_entities(client, entity_types, limit)
+    # Get deduplicated unenriched entities
+    print(f"\n{color('Filtering unenriched entities...', Colors.CYAN)}")
+    entities = filter_unenriched_entities(all_entities, entity_types, limit)
     stats.total = len(entities)
 
     if stats.total == 0:
-        print(f"{color('✓ All entities are already enriched!', Colors.GREEN)}")
+        print(f"{color('All entities are already enriched!', Colors.GREEN)}")
         return stats
 
-    print(f"Found {color(str(stats.total), Colors.BOLD)} entities to enrich")
+    print(f"Found {color(str(stats.total), Colors.BOLD)} unique entities to enrich")
 
     if dry_run:
         print(f"{color('DRY RUN - no changes will be made', Colors.YELLOW)}")
         for entity in entities[:10]:
-            print(f"  Would enrich: {entity['name']} ({entity['type']})")
+            print(f"  Would enrich: {entity.get('name', '?')} ({entity.get('type', '?')})")
         if stats.total > 10:
             print(f"  ... and {stats.total - 10} more")
         return stats
@@ -325,8 +410,8 @@ async def enrich_entities(
     start_time = time.time()
 
     for i, entity in enumerate(entities):
-        entity_name = entity["name"]
-        entity_type = entity["type"]
+        entity_name = entity.get("name", "")
+        entity_type = entity.get("type", "")
         entity_id = entity["id"]
 
         # Print progress
@@ -341,17 +426,24 @@ async def enrich_entities(
             )
 
             if result.status == EnrichmentStatus.SUCCESS and result.has_data():
-                # Update entity with enrichment data
-                await update_entity_enrichment(client, entity_id, {
+                # Update all entities with this name
+                enrichment_data = {
                     "description": result.description,
                     "wikipedia_url": result.wikipedia_url,
                     "wikidata_id": result.wikidata_id,
                     "image_url": result.image_url,
-                })
+                }
+                updated = await update_entities_by_name(
+                    client, entity_name, all_entities, enrichment_data,
+                )
                 stats.enriched += 1
+                if updated > 1:
+                    logger.debug(f"Updated {updated} nodes for '{entity_name}'")
 
             elif result.status == EnrichmentStatus.NOT_FOUND:
-                await mark_entity_not_found(client, entity_id, "Not found in Wikipedia")
+                await mark_entities_not_found_by_name(
+                    client, entity_name, all_entities, "Not found in Wikipedia",
+                )
                 stats.not_found += 1
 
             elif result.status == EnrichmentStatus.RATE_LIMITED:
@@ -361,12 +453,17 @@ async def enrich_entities(
                 continue
 
             else:
-                await mark_entity_not_found(client, entity_id, result.error_message or "Unknown error")
+                await mark_entities_not_found_by_name(
+                    client, entity_name, all_entities,
+                    result.error_message or "Unknown error",
+                )
                 stats.errors += 1
 
         except Exception as e:
             logger.error(f"Error enriching {entity_name}: {e}")
-            await mark_entity_not_found(client, entity_id, str(e))
+            await mark_entities_not_found_by_name(
+                client, entity_name, all_entities, str(e),
+            )
             stats.errors += 1
 
         # Rate limiting
@@ -478,10 +575,15 @@ Examples:
     print(f"\n{color('Connecting to Memory Store...', Colors.CYAN)}")
 
     async with MemoryClient(settings) as client:
-        print(f"{color('✓ Connected', Colors.GREEN)}")
+        print(f"{color('Connected', Colors.GREEN)}")
+
+        # Load all entities once
+        print(f"\n{color('Loading entities from Memory Store...', Colors.CYAN)}")
+        all_entities = await get_all_entities(client)
+        print(f"  Loaded {len(all_entities):,} entity nodes")
 
         # Show status
-        status = await get_enrichment_status(client)
+        status = compute_enrichment_status(all_entities)
         print(f"\n{color('Current Status:', Colors.BOLD)}")
         print(f"  Total entities:    {status['total']:,}")
         print(f"  {color('Enriched:', Colors.GREEN)}        {status['enriched']:,}")
@@ -496,19 +598,20 @@ Examples:
             return
 
         if status['pending'] == 0:
-            print(f"\n{color('✓ All entities are already enriched!', Colors.GREEN)}")
+            print(f"\n{color('All entities are already enriched!', Colors.GREEN)}")
             return
 
-        # Estimate time
-        pending = status['pending']
-        if args.limit:
-            pending = min(pending, args.limit)
+        # Count unique unenriched names for time estimate
+        unique_unenriched = filter_unenriched_entities(all_entities, args.types, args.limit)
+        pending = len(unique_unenriched)
         estimated_time = pending * args.rate_limit
-        print(f"\n{color('Estimated time:', Colors.DIM)} {format_time(estimated_time)}")
+        print(f"\n  Unique names to enrich: {pending:,}")
+        print(f"  {color('Estimated time:', Colors.DIM)} {format_time(estimated_time)}")
 
         # Run enrichment
         stats = await enrich_entities(
             client,
+            all_entities,
             entity_types=args.types,
             limit=args.limit,
             rate_limit=args.rate_limit,
