@@ -432,17 +432,14 @@ def slugify(name: str) -> str:
 async def check_session_exists(memory: MemoryClient, session_id: str) -> bool:
     """Check if a session already exists in the database."""
     try:
-        messages = await memory.short_term.get_messages(session_id, limit=1)
-        return len(messages) > 0
+        conv = await memory.short_term.get_conversation(session_id, limit=1)
+        return conv is not None
     except Exception:
         return False
 
 
 async def check_sessions_exist_batch(memory: MemoryClient, session_ids: list[str]) -> set[str]:
     """Check which sessions already exist in the database (batch operation).
-
-    This is much more efficient than checking sessions one at a time,
-    especially when there are many sessions to check.
 
     Args:
         memory: MemoryClient instance
@@ -454,6 +451,7 @@ async def check_sessions_exist_batch(memory: MemoryClient, session_ids: list[str
     if not session_ids:
         return set()
 
+    # Try Cypher batch query first (Neo4j)
     query = """
     UNWIND $session_ids AS sid
     OPTIONAL MATCH (c:Conversation {session_id: sid})
@@ -465,7 +463,7 @@ async def check_sessions_exist_batch(memory: MemoryClient, session_ids: list[str
         results = await memory._client.execute_read(query, {"session_ids": session_ids})
         return {row["sid"] for row in results}
     except Exception:
-        # Fallback to individual checks if batch query fails
+        # Fallback to individual checks (works with all backends)
         existing = set()
         for sid in session_ids:
             if await check_session_exists(memory, sid):
@@ -893,6 +891,12 @@ Examples:
   # Then extract entities from loaded transcripts
   %(prog)s --extract-entities-only
 
+  # Export extracted entities to JSON (for sharing/backup)
+  %(prog)s --export-entities entities.json
+
+  # Import previously exported entities (skip re-extraction)
+  %(prog)s --load-entities entities.json
+
   # Load 5 sample transcripts for testing
   %(prog)s --sample 5
 
@@ -910,6 +914,7 @@ Examples:
 
 Performance Tips:
   - Use --no-entities for initial load, then --extract-entities-only
+  - Use --export-entities to save entities, --load-entities to restore them
   - Default batch size (100) and concurrency (3) are optimized for most cases
   - Database indexes are automatically created on first run
 """,
@@ -981,6 +986,18 @@ Performance Tips:
         help="Only extract entities from already loaded transcripts (run after initial load)",
     )
     parser.add_argument(
+        "--export-entities",
+        type=Path,
+        metavar="FILE",
+        help="Export extracted entities to a JSON file (for sharing/backup)",
+    )
+    parser.add_argument(
+        "--load-entities",
+        type=Path,
+        metavar="FILE",
+        help="Import entities from a previously exported JSON file (skip re-extraction)",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -1028,6 +1045,10 @@ Performance Tips:
         print(f"  {color('Mode:', Colors.DIM)} {color('DRY RUN', Colors.YELLOW)}")
     if args.extract_entities_only:
         print(f"  {color('Mode:', Colors.DIM)} {color('EXTRACT ENTITIES ONLY', Colors.BLUE)}")
+    if args.export_entities:
+        print(f"  {color('Mode:', Colors.DIM)} {color('EXPORT ENTITIES', Colors.BLUE)} → {args.export_entities}")
+    if args.load_entities:
+        print(f"  {color('Mode:', Colors.DIM)} {color('LOAD ENTITIES', Colors.BLUE)} ← {args.load_entities}")
     print()
 
     # Configure extraction settings for podcast transcripts
@@ -1087,6 +1108,27 @@ Performance Tips:
                 print("Setting up database indexes...", end=" ", flush=True)
                 await setup_database_schema(memory, verbose=args.verbose)
                 print(color("Done!", Colors.GREEN))
+
+            # Handle export-entities mode
+            if args.export_entities:
+                from manage_entities import export_entities as _export
+                export_args = argparse.Namespace(
+                    endpoint=args.memory_store_endpoint,
+                    output_file=str(args.export_entities),
+                )
+                _export(export_args)
+                sys.exit(0)
+
+            # Handle load-entities mode
+            if args.load_entities:
+                from manage_entities import import_entities as _import
+                import_args = argparse.Namespace(
+                    endpoint=args.memory_store_endpoint,
+                    input_file=str(args.load_entities),
+                    dry_run=args.dry_run,
+                )
+                _import(import_args)
+                sys.exit(0)
 
             # Handle extract-entities-only mode
             if args.extract_entities_only:
