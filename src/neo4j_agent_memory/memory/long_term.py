@@ -1,6 +1,6 @@
 """Long-term memory for entities, preferences, and facts."""
 
-import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,8 +11,11 @@ from uuid import UUID, uuid4
 from pydantic import Field
 
 from neo4j_agent_memory.core.memory import BaseMemory, MemoryEntry
-from neo4j_agent_memory.graph import queries
-from neo4j_agent_memory.graph.query_builder import build_create_entity_query
+from neo4j_agent_memory.graph.result_adapter import (
+    deserialize_metadata,
+    serialize_metadata,
+    to_python_datetime,
+)
 
 # =============================================================================
 # DEDUPLICATION CONFIGURATION
@@ -122,41 +125,11 @@ class DeduplicationStats:
     pending_reviews: int = 0
 
 
-def _serialize_metadata(metadata: dict[str, Any] | None) -> str | None:
-    """Serialize metadata dict to JSON string for Neo4j storage."""
-    if metadata is None or metadata == {}:
-        return None
-    return json.dumps(metadata)
-
-
-def _deserialize_metadata(metadata_str: str | None) -> dict[str, Any]:
-    """Deserialize metadata from JSON string."""
-    if metadata_str is None:
-        return {}
-    try:
-        return json.loads(metadata_str)
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
-
-def _to_python_datetime(neo4j_datetime) -> datetime:
-    """Convert Neo4j DateTime to Python datetime."""
-    if neo4j_datetime is None:
-        return datetime.utcnow()
-    if isinstance(neo4j_datetime, datetime):
-        return neo4j_datetime
-    # Neo4j DateTime has to_native() method
-    try:
-        return neo4j_datetime.to_native()
-    except AttributeError:
-        return datetime.utcnow()
-
-
 if TYPE_CHECKING:
     from neo4j_agent_memory.embeddings.base import Embedder
     from neo4j_agent_memory.enrichment.background import BackgroundEnrichmentService
     from neo4j_agent_memory.extraction.base import EntityExtractor
-    from neo4j_agent_memory.graph.client import Neo4jClient
+    from neo4j_agent_memory.graph.backend_protocol import GraphBackend
     from neo4j_agent_memory.resolution.base import EntityResolver
     from neo4j_agent_memory.services.geocoder import Geocoder
 
@@ -324,7 +297,7 @@ class LongTermMemory(BaseMemory[Entity]):
 
     def __init__(
         self,
-        client: "Neo4jClient",
+        client: "GraphBackend",
         embedder: "Embedder | None" = None,
         extractor: "EntityExtractor | None" = None,
         resolver: "EntityResolver | None" = None,
@@ -337,7 +310,7 @@ class LongTermMemory(BaseMemory[Entity]):
         """Initialize long-term memory.
 
         Args:
-            client: Neo4j client for database operations
+            client: GraphBackend for database operations
             embedder: Optional embedder for semantic search
             extractor: Optional entity extractor
             resolver: Optional entity resolver for deduplication
@@ -494,12 +467,16 @@ class LongTermMemory(BaseMemory[Entity]):
         if entity.aliases:
             storage_metadata["aliases"] = entity.aliases
 
-        # Store entity with dynamic labels for type/subtype
-        create_query = build_create_entity_query(entity.type, entity.subtype)
-        await self._client.execute_write(
-            create_query,
-            {
-                "id": str(entity.id),
+        # Build additional labels from type/subtype
+        additional_labels = [entity.type]
+        if entity.subtype:
+            additional_labels.append(entity.subtype)
+
+        # Store entity using GraphBackend upsert_node
+        await self._client.upsert_node(
+            "Entity",
+            id=str(entity.id),
+            properties={
                 "name": entity.name,
                 "type": entity.type,
                 "subtype": entity.subtype,
@@ -507,22 +484,26 @@ class LongTermMemory(BaseMemory[Entity]):
                 "description": entity.description,
                 "embedding": entity.embedding,
                 "confidence": entity.confidence,
-                "metadata": _serialize_metadata(storage_metadata) if storage_metadata else None,
-                "location": location_point,  # Neo4j Point for LOCATION entities
+                "metadata": serialize_metadata(storage_metadata) if storage_metadata else None,
+                "location": location_point,
             },
+            additional_labels=additional_labels,
         )
 
         # If flagged for review, create SAME_AS relationship
         if dedup_result.action == "flagged" and dedup_result.matched_entity_id:
-            await self._client.execute_write(
-                queries.CREATE_SAME_AS_RELATIONSHIP,
-                {
-                    "source_id": str(entity.id),
-                    "target_id": str(dedup_result.matched_entity_id),
+            await self._client.link_nodes(
+                "Entity",
+                str(entity.id),
+                "Entity",
+                str(dedup_result.matched_entity_id),
+                "SAME_AS",
+                properties={
                     "confidence": dedup_result.similarity_score,
                     "match_type": dedup_result.match_type or "embedding",
                     "status": "pending",
                 },
+                upsert=False,
             )
 
         # Queue for background enrichment (non-blocking)
@@ -580,17 +561,17 @@ class LongTermMemory(BaseMemory[Entity]):
             metadata=metadata or {},
         )
 
-        # Store preference
-        await self._client.execute_write(
-            queries.CREATE_PREFERENCE,
-            {
-                "id": str(pref.id),
+        # Store preference using GraphBackend upsert_node
+        await self._client.upsert_node(
+            "Preference",
+            id=str(pref.id),
+            properties={
                 "category": pref.category,
                 "preference": pref.preference,
                 "context": pref.context,
                 "confidence": pref.confidence,
                 "embedding": pref.embedding,
-                "metadata": _serialize_metadata(pref.metadata),
+                "metadata": serialize_metadata(pref.metadata),
             },
         )
 
@@ -643,11 +624,11 @@ class LongTermMemory(BaseMemory[Entity]):
             metadata=metadata or {},
         )
 
-        # Store fact
-        await self._client.execute_write(
-            queries.CREATE_FACT,
-            {
-                "id": str(fact.id),
+        # Store fact using GraphBackend upsert_node
+        await self._client.upsert_node(
+            "Fact",
+            id=str(fact.id),
+            properties={
                 "subject": fact.subject,
                 "predicate": fact.predicate,
                 "object": fact.object,
@@ -655,7 +636,7 @@ class LongTermMemory(BaseMemory[Entity]):
                 "embedding": fact.embedding,
                 "valid_from": fact.valid_from.isoformat() if fact.valid_from else None,
                 "valid_until": fact.valid_until.isoformat() if fact.valid_until else None,
-                "metadata": _serialize_metadata(fact.metadata),
+                "metadata": serialize_metadata(fact.metadata),
             },
         )
 
@@ -704,18 +685,20 @@ class LongTermMemory(BaseMemory[Entity]):
             attributes=attributes or {},
         )
 
-        await self._client.execute_write(
-            queries.CREATE_ENTITY_RELATIONSHIP,
-            {
+        await self._client.link_nodes(
+            "Entity",
+            str(source_id),
+            "Entity",
+            str(target_id),
+            relationship_type,
+            properties={
                 "id": str(relationship.id),
-                "source_id": str(source_id),
-                "target_id": str(target_id),
-                "relation_type": relationship_type,
                 "description": description,
                 "confidence": confidence,
                 "valid_from": valid_from.isoformat() if valid_from else None,
                 "valid_until": valid_until.isoformat() if valid_until else None,
             },
+            upsert=True,
         )
 
         return relationship
@@ -725,23 +708,17 @@ class LongTermMemory(BaseMemory[Entity]):
         Get an entity by name.
 
         Args:
-            name: Entity name to search for (checks name, canonical_name, aliases)
+            name: Entity name to search for (checks name property)
 
         Returns:
             The entity if found, None otherwise
         """
-        results = await self._client.execute_read(
-            queries.GET_ENTITY_BY_NAME,
-            {"name": name},
-        )
+        result = await self._client.get_node("Entity", filters={"name": name})
 
-        if not results:
+        if not result:
             return None
 
-        row = results[0]
-        entity_data = dict(row["e"])
-
-        return self._parse_entity(entity_data)
+        return self._parse_entity(result)
 
     async def search(self, query: str, **kwargs: Any) -> list[Entity]:
         """Search for entities."""
@@ -772,13 +749,12 @@ class LongTermMemory(BaseMemory[Entity]):
 
         query_embedding = await self._embedder.embed(query)
 
-        results = await self._client.execute_read(
-            queries.SEARCH_ENTITIES_BY_EMBEDDING,
-            {
-                "embedding": query_embedding,
-                "limit": limit,
-                "threshold": threshold,
-            },
+        results = await self._client.vector_search(
+            "Entity",
+            "embedding",
+            query_embedding,
+            limit=limit,
+            threshold=threshold,
         )
 
         # Normalize filter types
@@ -788,15 +764,14 @@ class LongTermMemory(BaseMemory[Entity]):
 
         entities = []
         for row in results:
-            entity_data = dict(row["e"])
-            entity_type = entity_data["type"]
+            entity_type = row.get("type")
 
             # Filter by type if specified
             if filter_types and entity_type not in filter_types:
                 continue
 
-            entity = self._parse_entity(entity_data)
-            entity.metadata["similarity"] = row["score"]
+            entity = self._parse_entity(row)
+            entity.metadata["similarity"] = row["_score"]
             entities.append(entity)
 
         return entities
@@ -824,34 +799,32 @@ class LongTermMemory(BaseMemory[Entity]):
         if self._embedder is None:
             # Fall back to category-based search
             if category:
-                results = await self._client.execute_read(
-                    queries.SEARCH_PREFERENCES_BY_CATEGORY,
-                    {"category": category, "limit": limit},
+                results = await self._client.query_nodes(
+                    "Preference",
+                    filters={"category": category},
+                    limit=limit,
                 )
-                return [self._parse_preference(dict(r["p"])) for r in results]
+                return [self._parse_preference(r) for r in results]
             return []
 
         query_embedding = await self._embedder.embed(query)
 
-        results = await self._client.execute_read(
-            queries.SEARCH_PREFERENCES_BY_EMBEDDING,
-            {
-                "embedding": query_embedding,
-                "limit": limit,
-                "threshold": threshold,
-            },
+        results = await self._client.vector_search(
+            "Preference",
+            "embedding",
+            query_embedding,
+            limit=limit,
+            threshold=threshold,
         )
 
         preferences = []
         for row in results:
-            pref_data = dict(row["p"])
-
             # Filter by category if specified
-            if category and pref_data.get("category") != category:
+            if category and row.get("category") != category:
                 continue
 
-            pref = self._parse_preference(pref_data)
-            pref.metadata["similarity"] = row["score"]
+            pref = self._parse_preference(row)
+            pref.metadata["similarity"] = row["_score"]
             preferences.append(pref)
 
         return preferences
@@ -876,46 +849,36 @@ class LongTermMemory(BaseMemory[Entity]):
         """
         entity_id = entity.id if isinstance(entity, Entity) else entity
 
-        results = await self._client.execute_read(
-            queries.GET_ENTITY_RELATIONSHIPS,
-            {"entity_id": str(entity_id)},
+        results = await self._client.traverse(
+            "Entity",
+            str(entity_id),
+            relationship_types=relationship_types,
+            direction="both",
+            include_edges=True,
         )
 
         related = []
         for row in results:
-            # Neo4j relationship object has different access pattern
-            rel = row["r"]
-            # Get relationship properties - use dict() if available, else access via _properties
-            if hasattr(rel, "_properties"):
-                rel_data = dict(rel._properties)
-            elif hasattr(rel, "items"):
-                rel_data = dict(rel)
-            else:
-                # Fallback: create empty dict and get individual properties
-                rel_data = {}
-                for key in ["id", "type", "confidence", "description", "valid_from", "valid_until"]:
-                    try:
-                        val = rel.get(key) if hasattr(rel, "get") else getattr(rel, key, None)
-                        if val is not None:
-                            rel_data[key] = val
-                    except Exception:
-                        pass
+            # GraphBackend traverse returns flat dicts with _edge key
+            edge_data = row.get("_edge", {})
 
-            other_data = dict(row["other"])
+            # Extract relationship type from edge data
+            rel_type = edge_data.get("type") or "RELATED_TO"
 
-            # Filter by relationship type
-            rel_type = rel_data.get("type") or (rel.type if hasattr(rel, "type") else "RELATED_TO")
+            # Filter by relationship type if specified
             if relationship_types and rel_type not in relationship_types:
                 continue
 
-            other_entity = self._parse_entity(other_data)
+            # Remove _edge from row before parsing as entity
+            entity_data = {k: v for k, v in row.items() if k != "_edge"}
+            other_entity = self._parse_entity(entity_data)
 
             relationship = Relationship(
-                id=UUID(rel_data.get("id", str(uuid4()))),
+                id=UUID(edge_data.get("id", str(uuid4()))),
                 source_id=entity_id,
                 target_id=other_entity.id,
                 type=rel_type,
-                confidence=rel_data.get("confidence", 1.0),
+                confidence=edge_data.get("confidence", 1.0),
             )
 
             related.append((other_entity, relationship))
@@ -968,16 +931,16 @@ class LongTermMemory(BaseMemory[Entity]):
 
     async def _get_existing_entity_names(self, entity_type: str) -> list[str]:
         """Get names of existing entities of a given type."""
-        results = await self._client.execute_read(
-            queries.SEARCH_ENTITIES_BY_TYPE,
-            {"type": entity_type, "limit": 1000},
+        results = await self._client.query_nodes(
+            "Entity",
+            filters={"type": entity_type},
+            limit=1000,
         )
         names = []
         for row in results:
-            entity_data = dict(row["e"])
-            names.append(entity_data["name"])
-            if entity_data.get("canonical_name"):
-                names.append(entity_data["canonical_name"])
+            names.append(row["name"])
+            if row.get("canonical_name"):
+                names.append(row["canonical_name"])
         return list(set(names))
 
     # =========================================================================
@@ -1003,14 +966,13 @@ class LongTermMemory(BaseMemory[Entity]):
         config = self._deduplication
 
         # Search for similar entities by embedding
-        results = await self._client.execute_read(
-            queries.FIND_SIMILAR_ENTITIES_BY_EMBEDDING,
-            {
-                "embedding": embedding,
-                "limit": config.max_candidates,
-                "threshold": config.flag_threshold,
-                "type": entity_type if config.match_same_type_only else None,
-            },
+        results = await self._client.vector_search(
+            "Entity",
+            "embedding",
+            embedding,
+            limit=config.max_candidates,
+            threshold=config.flag_threshold,
+            filters={"type": entity_type} if config.match_same_type_only else None,
         )
 
         if not results:
@@ -1022,11 +984,10 @@ class LongTermMemory(BaseMemory[Entity]):
         match_type = "embedding"
 
         for row in results:
-            entity_data = dict(row["e"])
-            score = row["score"]
+            score = row["_score"]
 
             # Skip if this is a merged entity
-            if entity_data.get("merged_into"):
+            if row.get("merged_into"):
                 continue
 
             # Check fuzzy matching if enabled
@@ -1036,8 +997,8 @@ class LongTermMemory(BaseMemory[Entity]):
                     from rapidfuzz import fuzz
 
                     # Check against name and canonical name
-                    name_score = fuzz.ratio(name.lower(), entity_data["name"].lower()) / 100
-                    canonical_name = entity_data.get("canonical_name") or entity_data["name"]
+                    name_score = fuzz.ratio(name.lower(), row["name"].lower()) / 100
+                    canonical_name = row.get("canonical_name") or row["name"]
                     canonical_score = fuzz.ratio(name.lower(), canonical_name.lower()) / 100
                     fuzzy_score = max(name_score, canonical_score)
 
@@ -1047,7 +1008,7 @@ class LongTermMemory(BaseMemory[Entity]):
                         combined_score = (score + fuzzy_score) / 2
                         if combined_score > best_score:
                             best_score = combined_score
-                            best_match = entity_data
+                            best_match = row
                             match_type = "both"
                         continue
                 except ImportError:
@@ -1055,7 +1016,7 @@ class LongTermMemory(BaseMemory[Entity]):
 
             if score > best_score:
                 best_score = score
-                best_match = entity_data
+                best_match = row
                 match_type = "embedding"
 
         if best_match is None:
@@ -1092,15 +1053,12 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             Entity if found, None otherwise
         """
-        results = await self._client.execute_read(
-            queries.GET_ENTITY,
-            {"id": str(entity_id)},
-        )
+        result = await self._client.get_node("Entity", id=str(entity_id))
 
-        if not results:
+        if not result:
             return None
 
-        return self._parse_entity(dict(results[0]["e"]))
+        return self._parse_entity(result)
 
     async def _add_alias_to_entity(self, entity_id: UUID, alias: str) -> None:
         """Add an alias to an existing entity.
@@ -1125,16 +1083,10 @@ class LongTermMemory(BaseMemory[Entity]):
         if entity.attributes:
             storage_metadata["attributes"] = entity.attributes
 
-        await self._client.execute_write(
-            """
-            MATCH (e:Entity {id: $id})
-            SET e.metadata = $metadata
-            RETURN e
-            """,
-            {
-                "id": str(entity_id),
-                "metadata": _serialize_metadata(storage_metadata),
-            },
+        await self._client.update_node(
+            "Entity",
+            str(entity_id),
+            properties={"metadata": serialize_metadata(storage_metadata)},
         )
 
     async def find_potential_duplicates(
@@ -1152,27 +1104,51 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of (entity1, entity2, confidence) tuples
         """
-        results = await self._client.execute_read(
-            queries.GET_POTENTIAL_DUPLICATES,
-            {"limit": limit},
-        )
+        # Get all entities, then check for SAME_AS relationships.
+        # We traverse from each entity looking for SAME_AS edges with pending status.
+        all_entities = await self._client.query_nodes("Entity", limit=limit * 2)
 
         duplicates = []
-        for row in results:
-            entity1 = self._parse_entity(dict(row["e1"]))
-            entity2 = self._parse_entity(dict(row["e2"]))
+        seen_pairs: set[tuple[str, str]] = set()
 
-            # Get relationship properties
-            rel = row["r"]
-            if hasattr(rel, "_properties"):
-                rel_data = dict(rel._properties)
-            elif hasattr(rel, "items"):
-                rel_data = dict(rel)
-            else:
-                rel_data = {}
+        for entity_data in all_entities:
+            entity_id = entity_data.get("id")
+            if not entity_id:
+                continue
 
-            confidence = rel_data.get("confidence", 0.0)
-            duplicates.append((entity1, entity2, confidence))
+            # Traverse SAME_AS relationships from this entity
+            neighbors = await self._client.traverse(
+                "Entity",
+                entity_id,
+                relationship_types=["SAME_AS"],
+                direction="both",
+                include_edges=True,
+                limit=limit,
+            )
+
+            for neighbor in neighbors:
+                edge_data = neighbor.get("_edge", {})
+                if edge_data.get("status") != "pending":
+                    continue
+
+                neighbor_id = neighbor.get("id")
+                if not neighbor_id:
+                    continue
+
+                # Avoid duplicate pairs (A,B) and (B,A)
+                pair_key = tuple(sorted([entity_id, neighbor_id]))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+
+                entity1 = self._parse_entity(entity_data)
+                neighbor_data = {k: v for k, v in neighbor.items() if k != "_edge"}
+                entity2 = self._parse_entity(neighbor_data)
+                confidence = edge_data.get("confidence", 0.0)
+                duplicates.append((entity1, entity2, confidence))
+
+                if len(duplicates) >= limit:
+                    return duplicates
 
         return duplicates
 
@@ -1193,21 +1169,75 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             Tuple of (source, target) entities after merge, or None if not found
         """
-        results = await self._client.execute_write(
-            queries.MERGE_ENTITIES,
-            {
-                "source_id": str(source_id),
-                "target_id": str(target_id),
+        # 1. Get both entities
+        source = await self._client.get_node("Entity", id=str(source_id))
+        target = await self._client.get_node("Entity", id=str(target_id))
+
+        if not source or not target:
+            return None
+
+        # 2. Transfer relationships from source to target
+        # Get all relationships from source (SAME_AS, RELATED_TO, etc.)
+        source_rels = await self._client.traverse(
+            "Entity",
+            str(source_id),
+            direction="both",
+            include_edges=True,
+        )
+
+        for rel_node in source_rels:
+            edge_data = rel_node.get("_edge", {})
+            other_id = rel_node.get("id")
+            if not other_id or other_id == str(target_id):
+                continue
+
+            # Determine relationship type from edge data
+            rel_type = edge_data.get("type", "RELATED_TO")
+
+            # Create equivalent relationship to target (skip if already exists)
+            rel_props = {k: v for k, v in edge_data.items() if k not in ("type",)}
+            await self._client.link_nodes(
+                "Entity",
+                str(target_id),
+                "Entity",
+                other_id,
+                rel_type,
+                properties=rel_props,
+                upsert=True,
+            )
+
+        # 3. Add source name as alias on target
+        target_metadata = deserialize_metadata(target.get("metadata"))
+        target_aliases = target_metadata.get("aliases", [])
+        source_name = source.get("name", "")
+        if source_name and source_name not in target_aliases:
+            target_aliases.append(source_name)
+        target_metadata["aliases"] = target_aliases
+
+        await self._client.update_node(
+            "Entity",
+            str(target_id),
+            properties={"metadata": serialize_metadata(target_metadata)},
+        )
+
+        # 4. Mark source as merged
+        await self._client.update_node(
+            "Entity",
+            str(source_id),
+            properties={
+                "merged_into": str(target_id),
+                "merged_at": datetime.utcnow().isoformat(),
             },
         )
 
-        if not results:
+        # Re-fetch both entities for return
+        updated_source = await self._client.get_node("Entity", id=str(source_id))
+        updated_target = await self._client.get_node("Entity", id=str(target_id))
+
+        if not updated_source or not updated_target:
             return None
 
-        source = self._parse_entity(dict(results[0]["source"]))
-        target = self._parse_entity(dict(results[0]["target"]))
-
-        return source, target
+        return self._parse_entity(updated_source), self._parse_entity(updated_target)
 
     async def review_duplicate(
         self,
@@ -1230,25 +1260,33 @@ class LongTermMemory(BaseMemory[Entity]):
             # Merge the entities
             result = await self.merge_duplicate_entities(source_id, target_id)
             if result:
-                # Update SAME_AS relationship status
-                await self._client.execute_write(
-                    queries.UPDATE_SAME_AS_STATUS,
-                    {
-                        "source_id": str(source_id),
-                        "target_id": str(target_id),
+                # Update SAME_AS relationship status using link_nodes with upsert
+                await self._client.link_nodes(
+                    "Entity",
+                    str(source_id),
+                    "Entity",
+                    str(target_id),
+                    "SAME_AS",
+                    properties={
                         "status": "confirmed",
+                        "updated_at": datetime.utcnow().isoformat(),
                     },
+                    upsert=True,
                 )
                 return True
         else:
-            # Mark as rejected (not a duplicate)
-            await self._client.execute_write(
-                queries.UPDATE_SAME_AS_STATUS,
-                {
-                    "source_id": str(source_id),
-                    "target_id": str(target_id),
+            # Mark as rejected (not a duplicate) using link_nodes with upsert
+            await self._client.link_nodes(
+                "Entity",
+                str(source_id),
+                "Entity",
+                str(target_id),
+                "SAME_AS",
+                properties={
                     "status": "rejected",
+                    "updated_at": datetime.utcnow().isoformat(),
                 },
+                upsert=True,
             )
             return True
 
@@ -1266,17 +1304,23 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of entities in the same cluster (including the input entity)
         """
-        results = await self._client.execute_read(
-            queries.GET_SAME_AS_CLUSTER,
-            {"entity_id": str(entity_id)},
-        )
-
         # Start with the original entity
         original = await self._get_entity_by_id(entity_id)
         entities = [original] if original else []
 
+        # Traverse SAME_AS relationships up to depth 2
+        results = await self._client.traverse(
+            "Entity",
+            str(entity_id),
+            relationship_types=["SAME_AS"],
+            direction="both",
+            depth=2,
+        )
+
         for row in results:
-            entity = self._parse_entity(dict(row["entity"]))
+            # Remove _edge key if present before parsing
+            entity_data = {k: v for k, v in row.items() if k != "_edge"}
+            entity = self._parse_entity(entity_data)
             entities.append(entity)
 
         return entities
@@ -1287,20 +1331,51 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             DeduplicationStats with counts
         """
-        results = await self._client.execute_read(
-            queries.GET_DEDUPLICATION_STATS,
-            {},
-        )
+        # Total entities
+        total_entities = await self._client.count_nodes("Entity")
 
-        if not results:
-            return DeduplicationStats()
+        # Merged entities: query all entities and count those with merged_into set
+        all_entities = await self._client.query_nodes("Entity", limit=10000)
+        merged_entities = sum(1 for e in all_entities if e.get("merged_into"))
 
-        row = results[0]
+        # SAME_AS relationships and pending reviews: traverse from all entities
+        same_as_count = 0
+        pending_count = 0
+        seen_pairs: set[tuple[str, str]] = set()
+
+        for entity_data in all_entities:
+            entity_id = entity_data.get("id")
+            if not entity_id:
+                continue
+
+            neighbors = await self._client.traverse(
+                "Entity",
+                entity_id,
+                relationship_types=["SAME_AS"],
+                direction="both",
+                include_edges=True,
+            )
+
+            for neighbor in neighbors:
+                neighbor_id = neighbor.get("id")
+                if not neighbor_id:
+                    continue
+
+                pair_key = tuple(sorted([entity_id, neighbor_id]))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+
+                same_as_count += 1
+                edge_data = neighbor.get("_edge", {})
+                if edge_data.get("status") == "pending":
+                    pending_count += 1
+
         return DeduplicationStats(
-            total_entities=row["total_entities"],
-            merged_entities=row["merged_entities"],
-            same_as_relationships=row["same_as_relationships"],
-            pending_reviews=row["pending_reviews"],
+            total_entities=total_entities,
+            merged_entities=merged_entities,
+            same_as_relationships=same_as_count,
+            pending_reviews=pending_count,
         )
 
     # =========================================================================
@@ -1326,25 +1401,21 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             Dict with extractor details
         """
-        results = await self._client.execute_write(
-            queries.CREATE_EXTRACTOR,
-            {
-                "id": str(uuid4()),
+        result = await self._client.upsert_node(
+            "Extractor",
+            id=str(uuid4()),
+            properties={
                 "name": name,
                 "version": version,
-                "config": _serialize_metadata(config) if config else None,
+                "config": serialize_metadata(config) if config else None,
             },
         )
 
-        if results and "ex" in results[0]:
-            node = results[0]["ex"]
-            return {
-                "id": node.get("id"),
-                "name": node.get("name"),
-                "version": node.get("version"),
-            }
-
-        return {"name": name, "version": version}
+        return {
+            "id": result.get("id"),
+            "name": result.get("name"),
+            "version": result.get("version"),
+        }
 
     async def link_entity_to_message(
         self,
@@ -1373,19 +1444,22 @@ class LongTermMemory(BaseMemory[Entity]):
         """
         entity_id = entity.id if isinstance(entity, Entity) else entity
 
-        results = await self._client.execute_write(
-            queries.CREATE_EXTRACTED_FROM_RELATIONSHIP,
-            {
-                "entity_id": str(entity_id),
-                "message_id": str(message_id),
+        result = await self._client.link_nodes(
+            "Entity",
+            str(entity_id),
+            "Message",
+            str(message_id),
+            "EXTRACTED_FROM",
+            properties={
                 "confidence": confidence,
                 "start_pos": start_pos,
                 "end_pos": end_pos,
                 "context": context,
             },
+            upsert=True,
         )
 
-        return bool(results)
+        return result is not None
 
     async def link_entity_to_extractor(
         self,
@@ -1413,17 +1487,31 @@ class LongTermMemory(BaseMemory[Entity]):
         # Ensure extractor exists
         await self.register_extractor(extractor_name)
 
-        results = await self._client.execute_write(
-            queries.CREATE_EXTRACTED_BY_RELATIONSHIP,
-            {
-                "entity_id": str(entity_id),
-                "extractor_name": extractor_name,
+        # Find extractor by name to get its id
+        extractor_node = await self._client.get_node(
+            "Extractor", filters={"name": extractor_name}
+        )
+        if not extractor_node:
+            return False
+
+        extractor_id = extractor_node.get("id")
+        if not extractor_id:
+            return False
+
+        result = await self._client.link_nodes(
+            "Entity",
+            str(entity_id),
+            "Extractor",
+            extractor_id,
+            "EXTRACTED_BY",
+            properties={
                 "confidence": confidence,
                 "extraction_time_ms": extraction_time_ms,
             },
+            upsert=True,
         )
 
-        return bool(results)
+        return result is not None
 
     async def get_entity_provenance(
         self,
@@ -1442,62 +1530,49 @@ class LongTermMemory(BaseMemory[Entity]):
         """
         entity_id = entity.id if isinstance(entity, Entity) else entity
 
-        results = await self._client.execute_read(
-            queries.GET_ENTITY_PROVENANCE,
-            {"entity_id": str(entity_id)},
+        # Get EXTRACTED_FROM relationships (to Messages)
+        source_results = await self._client.traverse(
+            "Entity",
+            str(entity_id),
+            relationship_types=["EXTRACTED_FROM"],
+            direction="outgoing",
+            target_labels=["Message"],
+            include_edges=True,
         )
 
-        if not results:
-            return {"sources": [], "extractors": []}
-
-        row = results[0]
-
-        # Parse sources
         sources = []
-        for item in row.get("sources", []):
-            if item.get("message"):
-                msg = item["message"]
-                rel = item.get("relationship", {})
-                # Handle relationship properties
-                if hasattr(rel, "_properties"):
-                    rel_data = dict(rel._properties)
-                elif hasattr(rel, "items"):
-                    rel_data = dict(rel)
-                else:
-                    rel_data = {}
+        for row in source_results:
+            edge_data = row.get("_edge", {})
+            node_data = {k: v for k, v in row.items() if k != "_edge"}
+            sources.append({
+                "message_id": node_data.get("id"),
+                "content": node_data.get("content"),
+                "confidence": edge_data.get("confidence"),
+                "start_pos": edge_data.get("start_pos"),
+                "end_pos": edge_data.get("end_pos"),
+                "context": edge_data.get("context"),
+            })
 
-                sources.append(
-                    {
-                        "message_id": msg.get("id"),
-                        "content": msg.get("content"),
-                        "confidence": rel_data.get("confidence"),
-                        "start_pos": rel_data.get("start_pos"),
-                        "end_pos": rel_data.get("end_pos"),
-                        "context": rel_data.get("context"),
-                    }
-                )
+        # Get EXTRACTED_BY relationships (to Extractors)
+        extractor_results = await self._client.traverse(
+            "Entity",
+            str(entity_id),
+            relationship_types=["EXTRACTED_BY"],
+            direction="outgoing",
+            target_labels=["Extractor"],
+            include_edges=True,
+        )
 
-        # Parse extractors
         extractors = []
-        for item in row.get("extractors", []):
-            if item.get("extractor"):
-                ex = item["extractor"]
-                rel = item.get("relationship", {})
-                if hasattr(rel, "_properties"):
-                    rel_data = dict(rel._properties)
-                elif hasattr(rel, "items"):
-                    rel_data = dict(rel)
-                else:
-                    rel_data = {}
-
-                extractors.append(
-                    {
-                        "name": ex.get("name"),
-                        "version": ex.get("version"),
-                        "confidence": rel_data.get("confidence"),
-                        "extraction_time_ms": rel_data.get("extraction_time_ms"),
-                    }
-                )
+        for row in extractor_results:
+            edge_data = row.get("_edge", {})
+            node_data = {k: v for k, v in row.items() if k != "_edge"}
+            extractors.append({
+                "name": node_data.get("name"),
+                "version": node_data.get("version"),
+                "confidence": edge_data.get("confidence"),
+                "extraction_time_ms": edge_data.get("extraction_time_ms"),
+            })
 
         return {
             "sources": sources,
@@ -1516,27 +1591,27 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of (entity, extraction_info) tuples, ordered by position
         """
-        results = await self._client.execute_read(
-            queries.GET_ENTITIES_FROM_MESSAGE,
-            {"message_id": str(message_id)},
+        results = await self._client.traverse(
+            "Message",
+            str(message_id),
+            relationship_types=["EXTRACTED_FROM"],
+            direction="incoming",
+            target_labels=["Entity"],
+            include_edges=True,
         )
 
         entities = []
         for row in results:
-            entity = self._parse_entity(dict(row["e"]))
-            rel = row.get("r", {})
-            if hasattr(rel, "_properties"):
-                rel_data = dict(rel._properties)
-            elif hasattr(rel, "items"):
-                rel_data = dict(rel)
-            else:
-                rel_data = {}
+            edge_data = row.get("_edge", {})
+            entity_data = {k: v for k, v in row.items() if k != "_edge"}
+
+            entity = self._parse_entity(entity_data)
 
             extraction_info = {
-                "confidence": rel_data.get("confidence"),
-                "start_pos": rel_data.get("start_pos"),
-                "end_pos": rel_data.get("end_pos"),
-                "context": rel_data.get("context"),
+                "confidence": edge_data.get("confidence"),
+                "start_pos": edge_data.get("start_pos"),
+                "end_pos": edge_data.get("end_pos"),
+                "context": edge_data.get("context"),
             }
             entities.append((entity, extraction_info))
 
@@ -1557,25 +1632,37 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of (entity, extraction_info) tuples
         """
-        results = await self._client.execute_read(
-            queries.GET_ENTITIES_BY_EXTRACTOR,
-            {"extractor_name": extractor_name, "limit": limit},
+        # Find extractor by name
+        extractor_node = await self._client.get_node(
+            "Extractor", filters={"name": extractor_name}
+        )
+        if not extractor_node:
+            return []
+
+        extractor_id = extractor_node.get("id")
+        if not extractor_id:
+            return []
+
+        results = await self._client.traverse(
+            "Extractor",
+            extractor_id,
+            relationship_types=["EXTRACTED_BY"],
+            direction="incoming",
+            target_labels=["Entity"],
+            include_edges=True,
+            limit=limit,
         )
 
         entities = []
         for row in results:
-            entity = self._parse_entity(dict(row["e"]))
-            rel = row.get("r", {})
-            if hasattr(rel, "_properties"):
-                rel_data = dict(rel._properties)
-            elif hasattr(rel, "items"):
-                rel_data = dict(rel)
-            else:
-                rel_data = {}
+            edge_data = row.get("_edge", {})
+            entity_data = {k: v for k, v in row.items() if k != "_edge"}
+
+            entity = self._parse_entity(entity_data)
 
             extraction_info = {
-                "confidence": rel_data.get("confidence"),
-                "extraction_time_ms": rel_data.get("extraction_time_ms"),
+                "confidence": edge_data.get("confidence"),
+                "extraction_time_ms": edge_data.get("extraction_time_ms"),
             }
             entities.append((entity, extraction_info))
 
@@ -1587,22 +1674,28 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of extractor info dicts with name, version, entity_count
         """
-        results = await self._client.execute_read(
-            queries.LIST_EXTRACTORS,
-            {},
-        )
+        extractor_nodes = await self._client.query_nodes("Extractor")
 
         extractors = []
-        for row in results:
-            ex = row.get("ex")
-            if ex:
-                extractors.append(
-                    {
-                        "name": ex.get("name"),
-                        "version": ex.get("version"),
-                        "entity_count": row.get("entity_count", 0),
-                    }
+        for ex in extractor_nodes:
+            ex_id = ex.get("id")
+            # Count entities linked to this extractor
+            entity_count = 0
+            if ex_id:
+                entities = await self._client.traverse(
+                    "Extractor",
+                    ex_id,
+                    relationship_types=["EXTRACTED_BY"],
+                    direction="incoming",
+                    target_labels=["Entity"],
                 )
+                entity_count = len(entities)
+
+            extractors.append({
+                "name": ex.get("name"),
+                "version": ex.get("version"),
+                "entity_count": entity_count,
+            })
 
         return extractors
 
@@ -1612,23 +1705,37 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             Dict with total_entities, source_messages, extractors
         """
-        results = await self._client.execute_read(
-            queries.GET_EXTRACTION_STATS,
-            {},
-        )
+        total_entities = await self._client.count_nodes("Entity")
 
-        if not results:
-            return {
-                "total_entities": 0,
-                "source_messages": 0,
-                "extractors": [],
-            }
+        # Get all extractors
+        extractor_nodes = await self._client.query_nodes("Extractor")
+        extractor_names = [ex.get("name") for ex in extractor_nodes if ex.get("name")]
 
-        row = results[0]
+        # Count distinct source messages by traversing EXTRACTED_FROM
+        # This is an approximation: count entities with at least one source
+        all_entities = await self._client.query_nodes("Entity", limit=10000)
+        source_message_ids: set[str] = set()
+
+        for entity_data in all_entities:
+            entity_id = entity_data.get("id")
+            if not entity_id:
+                continue
+            sources = await self._client.traverse(
+                "Entity",
+                entity_id,
+                relationship_types=["EXTRACTED_FROM"],
+                direction="outgoing",
+                target_labels=["Message"],
+            )
+            for src in sources:
+                msg_id = src.get("id")
+                if msg_id:
+                    source_message_ids.add(msg_id)
+
         return {
-            "total_entities": row.get("total_entities", 0),
-            "source_messages": row.get("source_messages", 0),
-            "extractors": row.get("extractors", []),
+            "total_entities": total_entities,
+            "source_messages": len(source_message_ids),
+            "extractors": extractor_names,
         }
 
     async def get_extractor_stats(self) -> list[dict[str, Any]]:
@@ -1637,20 +1744,42 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of dicts with name, version, entity_count, avg_confidence
         """
-        results = await self._client.execute_read(
-            queries.GET_EXTRACTOR_STATS,
-            {},
-        )
+        extractor_nodes = await self._client.query_nodes("Extractor")
 
-        return [
-            {
-                "name": row.get("name"),
-                "version": row.get("version"),
-                "entity_count": row.get("entity_count", 0),
-                "avg_confidence": row.get("avg_confidence"),
-            }
-            for row in results
-        ]
+        stats = []
+        for ex in extractor_nodes:
+            ex_id = ex.get("id")
+            entity_count = 0
+            avg_confidence = None
+
+            if ex_id:
+                entities = await self._client.traverse(
+                    "Extractor",
+                    ex_id,
+                    relationship_types=["EXTRACTED_BY"],
+                    direction="incoming",
+                    target_labels=["Entity"],
+                    include_edges=True,
+                )
+                entity_count = len(entities)
+
+                # Compute average confidence from edge data
+                confidences = [
+                    e.get("_edge", {}).get("confidence")
+                    for e in entities
+                    if e.get("_edge", {}).get("confidence") is not None
+                ]
+                if confidences:
+                    avg_confidence = sum(confidences) / len(confidences)
+
+            stats.append({
+                "name": ex.get("name"),
+                "version": ex.get("version"),
+                "entity_count": entity_count,
+                "avg_confidence": avg_confidence,
+            })
+
+        return stats
 
     async def delete_entity_provenance(
         self,
@@ -1665,13 +1794,43 @@ class LongTermMemory(BaseMemory[Entity]):
             Number of relationships deleted
         """
         entity_id = entity.id if isinstance(entity, Entity) else entity
+        deleted = 0
 
-        results = await self._client.execute_write(
-            queries.DELETE_ENTITY_PROVENANCE,
-            {"entity_id": str(entity_id)},
+        # Find and unlink EXTRACTED_FROM relationships
+        sources = await self._client.traverse(
+            "Entity",
+            str(entity_id),
+            relationship_types=["EXTRACTED_FROM"],
+            direction="outgoing",
+            target_labels=["Message"],
         )
+        for src in sources:
+            msg_id = src.get("id")
+            if msg_id:
+                result = await self._client.unlink_nodes(
+                    "Entity", str(entity_id), "Message", msg_id, "EXTRACTED_FROM"
+                )
+                if result:
+                    deleted += 1
 
-        return results[0].get("deleted", 0) if results else 0
+        # Find and unlink EXTRACTED_BY relationships
+        extractors = await self._client.traverse(
+            "Entity",
+            str(entity_id),
+            relationship_types=["EXTRACTED_BY"],
+            direction="outgoing",
+            target_labels=["Extractor"],
+        )
+        for ex in extractors:
+            ex_id = ex.get("id")
+            if ex_id:
+                result = await self._client.unlink_nodes(
+                    "Entity", str(entity_id), "Extractor", ex_id, "EXTRACTED_BY"
+                )
+                if result:
+                    deleted += 1
+
+        return deleted
 
     async def get_preferences_by_category(
         self,
@@ -1689,11 +1848,12 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of preferences in the category
         """
-        results = await self._client.execute_read(
-            queries.SEARCH_PREFERENCES_BY_CATEGORY,
-            {"category": category, "limit": limit},
+        results = await self._client.query_nodes(
+            "Preference",
+            filters={"category": category},
+            limit=limit,
         )
-        return [self._parse_preference(dict(r["p"])) for r in results]
+        return [self._parse_preference(r) for r in results]
 
     async def get_facts_about(
         self,
@@ -1711,11 +1871,12 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of facts about the subject
         """
-        results = await self._client.execute_read(
-            queries.GET_FACTS_BY_SUBJECT,
-            {"subject": subject, "limit": limit},
+        results = await self._client.query_nodes(
+            "Fact",
+            filters={"subject": subject},
+            limit=limit,
         )
-        return [self._parse_fact(dict(r["f"])) for r in results]
+        return [self._parse_fact(r) for r in results]
 
     async def search_facts(
         self,
@@ -1740,19 +1901,18 @@ class LongTermMemory(BaseMemory[Entity]):
 
         query_embedding = await self._embedder.embed(query)
 
-        results = await self._client.execute_read(
-            queries.SEARCH_FACTS_BY_EMBEDDING,
-            {
-                "embedding": query_embedding,
-                "limit": limit,
-                "threshold": threshold,
-            },
+        results = await self._client.vector_search(
+            "Fact",
+            "embedding",
+            query_embedding,
+            limit=limit,
+            threshold=threshold,
         )
 
         facts = []
         for row in results:
-            fact = self._parse_fact(dict(row["f"]))
-            fact.metadata["similarity"] = row["score"]
+            fact = self._parse_fact(row)
+            fact.metadata["similarity"] = row["_score"]
             facts.append(fact)
 
         return facts
@@ -1778,8 +1938,8 @@ class LongTermMemory(BaseMemory[Entity]):
         return await self.get_related_entities(entity)
 
     def _parse_entity(self, data: dict[str, Any]) -> Entity:
-        """Parse entity from database result."""
-        metadata = _deserialize_metadata(data.get("metadata"))
+        """Parse entity from database result (flat dict from GraphBackend)."""
+        metadata = deserialize_metadata(data.get("metadata"))
         attributes = metadata.pop("attributes", {})
         aliases = metadata.pop("aliases", [])
 
@@ -1794,12 +1954,12 @@ class LongTermMemory(BaseMemory[Entity]):
             confidence=data.get("confidence", 1.0),
             aliases=aliases,
             attributes=attributes,
-            created_at=_to_python_datetime(data.get("created_at")),
+            created_at=to_python_datetime(data.get("created_at")),
             metadata=metadata,
         )
 
     def _parse_preference(self, data: dict[str, Any]) -> Preference:
-        """Parse preference from database result."""
+        """Parse preference from database result (flat dict from GraphBackend)."""
         return Preference(
             id=UUID(data["id"]),
             category=data["category"],
@@ -1807,12 +1967,12 @@ class LongTermMemory(BaseMemory[Entity]):
             context=data.get("context"),
             confidence=data.get("confidence", 1.0),
             embedding=data.get("embedding"),
-            created_at=_to_python_datetime(data.get("created_at")),
-            metadata=_deserialize_metadata(data.get("metadata")),
+            created_at=to_python_datetime(data.get("created_at")),
+            metadata=deserialize_metadata(data.get("metadata")),
         )
 
     def _parse_fact(self, data: dict[str, Any]) -> Fact:
-        """Parse fact from database result."""
+        """Parse fact from database result (flat dict from GraphBackend)."""
         return Fact(
             id=UUID(data["id"]),
             subject=data["subject"],
@@ -1820,14 +1980,14 @@ class LongTermMemory(BaseMemory[Entity]):
             object=data["object"],
             confidence=data.get("confidence", 1.0),
             embedding=data.get("embedding"),
-            valid_from=_to_python_datetime(data.get("valid_from"))
+            valid_from=to_python_datetime(data.get("valid_from"))
             if data.get("valid_from")
             else None,
-            valid_until=_to_python_datetime(data.get("valid_until"))
+            valid_until=to_python_datetime(data.get("valid_until"))
             if data.get("valid_until")
             else None,
-            created_at=_to_python_datetime(data.get("created_at")),
-            metadata=_deserialize_metadata(data.get("metadata")),
+            created_at=to_python_datetime(data.get("created_at")),
+            metadata=deserialize_metadata(data.get("metadata")),
         )
 
     # =========================================================================
@@ -1858,22 +2018,25 @@ class LongTermMemory(BaseMemory[Entity]):
         if self._geocoder is None:
             return {"processed": 0, "geocoded": 0}
 
-        # Get locations without coordinates
-        results = await self._client.execute_read(
-            queries.GET_LOCATIONS_WITHOUT_COORDINATES,
-            {},
+        # Get Location entities without coordinates
+        all_locations = await self._client.query_nodes(
+            "Entity",
+            filters={"type": "LOCATION"},
         )
 
-        if not results:
+        # Filter client-side for those without location
+        locations = [loc for loc in all_locations if loc.get("location") is None]
+
+        if not locations:
             return {"processed": 0, "geocoded": 0}
 
-        total = len(results)
+        total = len(locations)
         processed = 0
         geocoded = 0
 
         # Process in batches
         for i in range(0, total, batch_size):
-            batch = results[i : i + batch_size]
+            batch = locations[i : i + batch_size]
 
             for row in batch:
                 entity_id = row["id"]
@@ -1884,12 +2047,14 @@ class LongTermMemory(BaseMemory[Entity]):
 
                 if geocode_result is not None:
                     # Update the entity with coordinates
-                    await self._client.execute_write(
-                        queries.UPDATE_ENTITY_LOCATION,
-                        {
-                            "id": entity_id,
-                            "latitude": geocode_result.latitude,
-                            "longitude": geocode_result.longitude,
+                    await self._client.update_node(
+                        "Entity",
+                        entity_id,
+                        properties={
+                            "location": {
+                                "latitude": geocode_result.latitude,
+                                "longitude": geocode_result.longitude,
+                            }
                         },
                     )
                     geocoded += 1
@@ -1924,46 +2089,44 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of Location entities sorted by distance, with distance_meters in metadata
         """
-        # Convert km to meters for Neo4j query
         radius_meters = radius_km * 1000
 
-        if session_id:
-            # Filter to locations mentioned in the specific conversation
-            query = """
-                MATCH (e:Entity {type: 'LOCATION'})-[:EXTRACTED_FROM]->(m:Message)<-[:HAS_MESSAGE]-(c:Conversation {session_id: $session_id})
-                WITH DISTINCT e
-                WHERE e.location IS NOT NULL
-                WITH e, point.distance(
-                    point({latitude: $latitude, longitude: $longitude}),
-                    point({latitude: e.location.latitude, longitude: e.location.longitude})
-                ) AS distance_meters
-                WHERE distance_meters <= $radius_meters
-                RETURN e, distance_meters
-                ORDER BY distance_meters ASC
-                LIMIT $limit
-            """
-        else:
-            query = queries.SEARCH_LOCATIONS_NEAR
-
-        results = await self._client.execute_read(
-            query,
-            {
-                "latitude": latitude,
-                "longitude": longitude,
-                "radius_meters": radius_meters,
-                "session_id": session_id,
-                "limit": limit,
-            },
+        # Get all Location entities with coordinates
+        all_locations = await self._client.query_nodes(
+            "Entity",
+            filters={"type": "LOCATION"},
         )
 
-        entities = []
-        for row in results:
-            entity = self._parse_entity(dict(row["e"]))
-            entity.metadata["distance_meters"] = row["distance_meters"]
-            entity.metadata["distance_km"] = row["distance_meters"] / 1000
-            entities.append(entity)
+        # Client-side distance filtering and sorting
+        entities_with_distance = []
+        for row in all_locations:
+            loc = row.get("location")
+            if loc is None:
+                continue
 
-        return entities
+            # Extract lat/lon from location (could be dict or object)
+            if isinstance(loc, dict):
+                loc_lat = loc.get("latitude")
+                loc_lon = loc.get("longitude")
+            else:
+                loc_lat = getattr(loc, "latitude", None)
+                loc_lon = getattr(loc, "longitude", None)
+
+            if loc_lat is None or loc_lon is None:
+                continue
+
+            # Compute approximate distance using Haversine formula
+            distance_m = _haversine_distance(latitude, longitude, loc_lat, loc_lon)
+
+            if distance_m <= radius_meters:
+                entity = self._parse_entity(row)
+                entity.metadata["distance_meters"] = distance_m
+                entity.metadata["distance_km"] = distance_m / 1000
+                entities_with_distance.append((distance_m, entity))
+
+        # Sort by distance and apply limit
+        entities_with_distance.sort(key=lambda x: x[0])
+        return [e for _, e in entities_with_distance[:limit]]
 
     async def search_locations_in_bounding_box(
         self,
@@ -1989,35 +2152,36 @@ class LongTermMemory(BaseMemory[Entity]):
         Returns:
             List of Location entities within the bounding box
         """
-        if session_id:
-            # Filter to locations mentioned in the specific conversation
-            query = """
-                MATCH (e:Entity {type: 'LOCATION'})-[:EXTRACTED_FROM]->(m:Message)<-[:HAS_MESSAGE]-(c:Conversation {session_id: $session_id})
-                WITH DISTINCT e
-                WHERE e.location IS NOT NULL
-                  AND e.location.latitude >= $min_lat
-                  AND e.location.latitude <= $max_lat
-                  AND e.location.longitude >= $min_lon
-                  AND e.location.longitude <= $max_lon
-                RETURN e
-                LIMIT $limit
-            """
-        else:
-            query = queries.SEARCH_LOCATIONS_IN_BOUNDING_BOX
-
-        results = await self._client.execute_read(
-            query,
-            {
-                "min_lat": min_lat,
-                "min_lon": min_lon,
-                "max_lat": max_lat,
-                "max_lon": max_lon,
-                "session_id": session_id,
-                "limit": limit,
-            },
+        # Get all Location entities with coordinates
+        all_locations = await self._client.query_nodes(
+            "Entity",
+            filters={"type": "LOCATION"},
         )
 
-        return [self._parse_entity(dict(row["e"])) for row in results]
+        # Client-side bounding box filtering
+        entities = []
+        for row in all_locations:
+            loc = row.get("location")
+            if loc is None:
+                continue
+
+            if isinstance(loc, dict):
+                loc_lat = loc.get("latitude")
+                loc_lon = loc.get("longitude")
+            else:
+                loc_lat = getattr(loc, "latitude", None)
+                loc_lon = getattr(loc, "longitude", None)
+
+            if loc_lat is None or loc_lon is None:
+                continue
+
+            if min_lat <= loc_lat <= max_lat and min_lon <= loc_lon <= max_lon:
+                entities.append(self._parse_entity(row))
+
+            if len(entities) >= limit:
+                break
+
+        return entities
 
     async def get_location_coordinates(
         self,
@@ -2035,13 +2199,49 @@ class LongTermMemory(BaseMemory[Entity]):
         if isinstance(entity_id, UUID):
             entity_id = str(entity_id)
 
-        results = await self._client.execute_read(
-            queries.GET_LOCATION_COORDINATES,
-            {"id": entity_id},
-        )
+        result = await self._client.get_node("Entity", id=entity_id)
 
-        if not results:
+        if not result:
             return None
 
-        row = results[0]
-        return (row["latitude"], row["longitude"])
+        loc = result.get("location")
+        if loc is None:
+            return None
+
+        if isinstance(loc, dict):
+            lat = loc.get("latitude")
+            lon = loc.get("longitude")
+        else:
+            lat = getattr(loc, "latitude", None)
+            lon = getattr(loc, "longitude", None)
+
+        if lat is not None and lon is not None:
+            return (lat, lon)
+
+        return None
+
+
+def _haversine_distance(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    """Compute the Haversine distance between two points in meters.
+
+    Args:
+        lat1: Latitude of point 1 in degrees
+        lon1: Longitude of point 1 in degrees
+        lat2: Latitude of point 2 in degrees
+        lon2: Longitude of point 2 in degrees
+
+    Returns:
+        Distance in meters
+    """
+    R = 6371000  # Earth radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c

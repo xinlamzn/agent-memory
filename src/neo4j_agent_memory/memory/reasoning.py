@@ -9,18 +9,29 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field
 
 from neo4j_agent_memory.core.memory import BaseMemory, MemoryEntry
-from neo4j_agent_memory.graph import queries
+from neo4j_agent_memory.graph.result_adapter import (
+    deserialize_metadata,
+    serialize_metadata,
+    to_python_datetime,
+)
 
 
 def _serialize_json(data: dict[str, Any] | list | None) -> str | None:
-    """Serialize dict/list to JSON string for Neo4j storage."""
+    """Serialize dict/list to JSON string for storage.
+
+    ``serialize_metadata`` only handles dicts; this helper also covers
+    plain lists and the empty-collection → ``None`` mapping needed by
+    several call-sites.
+    """
     if data is None or data == {} or data == []:
         return None
+    if isinstance(data, dict):
+        return serialize_metadata(data)
     return json.dumps(data)
 
 
 def _deserialize_json(data_str: str | None) -> dict[str, Any] | list | None:
-    """Deserialize JSON string."""
+    """Deserialize JSON string (dicts and lists)."""
     if data_str is None:
         return None
     try:
@@ -29,22 +40,9 @@ def _deserialize_json(data_str: str | None) -> dict[str, Any] | list | None:
         return None
 
 
-def _to_python_datetime(neo4j_datetime) -> datetime:
-    """Convert Neo4j DateTime to Python datetime."""
-    if neo4j_datetime is None:
-        return datetime.utcnow()
-    if isinstance(neo4j_datetime, datetime):
-        return neo4j_datetime
-    # Neo4j DateTime has to_native() method
-    try:
-        return neo4j_datetime.to_native()
-    except AttributeError:
-        return datetime.utcnow()
-
-
 if TYPE_CHECKING:
     from neo4j_agent_memory.embeddings.base import Embedder
-    from neo4j_agent_memory.graph.client import Neo4jClient
+    from neo4j_agent_memory.graph.backend_protocol import GraphBackend
 
 
 class ToolCallStatus(str, Enum):
@@ -115,6 +113,23 @@ class ToolStats(BaseModel):
     success_rate: float = Field(default=0.0, description="Success rate (0.0 to 1.0)")
     avg_duration_ms: float | None = Field(default=None, description="Average duration in ms")
     last_used_at: datetime | None = Field(default=None, description="Last time tool was used")
+
+
+def _trace_from_dict(data: dict[str, Any]) -> ReasoningTrace:
+    """Build a ReasoningTrace from a flat node property dict."""
+    return ReasoningTrace(
+        id=UUID(data["id"]),
+        session_id=data["session_id"],
+        task=data["task"],
+        task_embedding=data.get("task_embedding"),
+        outcome=data.get("outcome"),
+        success=data.get("success"),
+        started_at=to_python_datetime(data.get("started_at")),
+        completed_at=to_python_datetime(data.get("completed_at"))
+        if data.get("completed_at")
+        else None,
+        metadata=deserialize_metadata(data.get("metadata")),
+    )
 
 
 class StreamingTraceRecorder:
@@ -294,9 +309,10 @@ class StreamingTraceRecorder:
         if self.current_step is None:
             raise RuntimeError("No active step. Call start_step() first.")
 
-        await self.memory._client.execute_write(
-            "MATCH (s:ReasoningStep {id: $id}) SET s.observation = $observation",
-            {"id": str(self.current_step.id), "observation": observation},
+        await self.memory._client.update_node(
+            "ReasoningStep",
+            str(self.current_step.id),
+            {"observation": observation},
         )
 
     def set_outcome(self, outcome: str, success: bool = True) -> None:
@@ -333,7 +349,7 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
 
     def __init__(
         self,
-        client: "Neo4jClient",
+        client: "GraphBackend",
         embedder: "Embedder | None" = None,
     ):
         """Initialize reasoning memory."""
@@ -387,16 +403,17 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
             metadata=metadata or {},
         )
 
-        await self._client.execute_write(
-            queries.CREATE_REASONING_TRACE,
-            {
-                "id": str(trace.id),
+        await self._client.upsert_node(
+            "ReasoningTrace",
+            id=str(trace.id),
+            properties={
                 "session_id": trace.session_id,
                 "task": trace.task,
                 "task_embedding": trace.task_embedding,
                 "outcome": None,
                 "success": None,
                 "completed_at": None,
+                "started_at": datetime.utcnow().isoformat(),
                 "metadata": _serialize_json(trace.metadata),
             },
         )
@@ -408,12 +425,12 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
                 if isinstance(triggered_by_message_id, UUID)
                 else triggered_by_message_id
             )
-            await self._client.execute_write(
-                queries.LINK_TRACE_TO_MESSAGE,
-                {
-                    "trace_id": str(trace.id),
-                    "message_id": msg_id_str,
-                },
+            await self._client.link_nodes(
+                "ReasoningTrace",
+                str(trace.id),
+                "Message",
+                msg_id_str,
+                "INITIATED_BY",
             )
 
         return trace
@@ -442,13 +459,15 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
         Returns:
             The created reasoning step
         """
-        # Get current step count
-        results = await self._client.execute_read(
-            "MATCH (:ReasoningTrace {id: $id})-[:HAS_STEP]->(s:ReasoningStep) "
-            "RETURN count(s) AS count",
-            {"id": str(trace_id)},
+        # Get current step count by traversing existing steps
+        existing_steps = await self._client.traverse(
+            "ReasoningTrace",
+            str(trace_id),
+            relationship_types=["HAS_STEP"],
+            target_labels=["ReasoningStep"],
+            direction="outgoing",
         )
-        step_number = results[0]["count"] + 1 if results else 1
+        step_number = len(existing_steps) + 1
 
         # Generate embedding
         embedding = None
@@ -474,18 +493,27 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
             metadata=metadata or {},
         )
 
-        await self._client.execute_write(
-            queries.CREATE_REASONING_STEP,
-            {
-                "trace_id": str(trace_id),
-                "id": str(step.id),
+        await self._client.create_node_with_links(
+            "ReasoningStep",
+            id=str(step.id),
+            properties={
                 "step_number": step.step_number,
                 "thought": step.thought,
                 "action": step.action,
                 "observation": step.observation,
                 "embedding": step.embedding,
+                "timestamp": datetime.utcnow().isoformat(),
                 "metadata": _serialize_json(step.metadata),
             },
+            links=[
+                {
+                    "target_label": "ReasoningTrace",
+                    "target_id": str(trace_id),
+                    "relationship_type": "HAS_STEP",
+                    "direction": "incoming",
+                    "properties": {"order": step.step_number},
+                },
+            ],
         )
 
         return step
@@ -534,37 +562,88 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
             error=error,
         )
 
-        await self._client.execute_write(
-            queries.CREATE_TOOL_CALL,
-            {
-                "step_id": str(step_id),
-                "id": str(tool_call.id),
+        status_value = status.value if hasattr(status, "value") else str(status)
+
+        # 1. Create the ToolCall node linked to its parent ReasoningStep
+        await self._client.create_node_with_links(
+            "ToolCall",
+            id=str(tool_call.id),
+            properties={
                 "tool_name": tool_name,
                 "arguments": _serialize_json(arguments),
                 "result": _serialize_json(result) if result is not None else None,
-                "status": status.value if hasattr(status, "value") else str(status),
+                "status": status_value,
                 "duration_ms": duration_ms,
                 "error": error,
+                "timestamp": datetime.utcnow().isoformat(),
+            },
+            links=[
+                {
+                    "target_label": "ReasoningStep",
+                    "target_id": str(step_id),
+                    "relationship_type": "USES_TOOL",
+                    "direction": "incoming",
+                },
+            ],
+        )
+
+        # 2. Upsert the Tool node (create if it doesn't exist)
+        await self._client.upsert_node(
+            "Tool",
+            id=tool_name,
+            properties={
+                "name": tool_name,
+                "created_at": datetime.utcnow().isoformat(),
+                "total_calls": 0,
+                "successful_calls": 0,
+                "failed_calls": 0,
+                "total_duration_ms": 0,
+            },
+            on_match_update={},  # Don't overwrite existing properties on match
+        )
+
+        # 3. Link ToolCall to Tool
+        await self._client.link_nodes(
+            "ToolCall",
+            str(tool_call.id),
+            "Tool",
+            tool_name,
+            "INSTANCE_OF",
+        )
+
+        # 4. Update Tool stats (atomic increments)
+        is_success = status_value == "success"
+        is_failure = status_value in ("error", "timeout")
+        await self._client.update_node(
+            "Tool",
+            tool_name,
+            properties={"last_used_at": datetime.utcnow().isoformat()},
+            increment={
+                "total_calls": 1,
+                "successful_calls": 1 if is_success else 0,
+                "failed_calls": 1 if is_failure else 0,
+                "total_duration_ms": duration_ms or 0,
             },
         )
 
         # Link to message if provided
         if message_id is not None:
             msg_id_str = str(message_id) if isinstance(message_id, UUID) else message_id
-            await self._client.execute_write(
-                queries.LINK_TOOL_CALL_TO_MESSAGE,
-                {
-                    "tool_call_id": str(tool_call.id),
-                    "message_id": msg_id_str,
-                },
+            await self._client.link_nodes(
+                "ToolCall",
+                str(tool_call.id),
+                "Message",
+                msg_id_str,
+                "TRIGGERED_BY",
             )
 
         # Auto-populate the step's observation from the tool result
         if auto_observation and result is not None:
             observation = self._format_observation(result)
-            await self._client.execute_write(
-                "MATCH (s:ReasoningStep {id: $id}) SET s.observation = $observation",
-                {"id": str(step_id), "observation": observation},
+            await self._client.update_node(
+                "ReasoningStep",
+                str(step_id),
+                {"observation": observation},
             )
 
         return tool_call
@@ -613,31 +692,20 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
         if generate_step_embeddings and self._embedder is not None:
             await self._generate_step_embeddings_batch(trace_id)
 
-        results = await self._client.execute_write(
-            queries.UPDATE_REASONING_TRACE,
+        trace_data = await self._client.update_node(
+            "ReasoningTrace",
+            str(trace_id),
             {
-                "id": str(trace_id),
                 "outcome": outcome,
                 "success": success,
+                "completed_at": datetime.utcnow().isoformat(),
             },
         )
 
-        if not results:
+        if not trace_data:
             raise ValueError(f"Trace not found: {trace_id}")
 
-        trace_data = dict(results[0]["rt"])
-        return ReasoningTrace(
-            id=UUID(trace_data["id"]),
-            session_id=trace_data["session_id"],
-            task=trace_data["task"],
-            task_embedding=trace_data.get("task_embedding"),
-            outcome=trace_data.get("outcome"),
-            success=trace_data.get("success"),
-            started_at=_to_python_datetime(trace_data.get("started_at")),
-            completed_at=_to_python_datetime(trace_data.get("completed_at"))
-            if trace_data.get("completed_at")
-            else None,
-        )
+        return _trace_from_dict(trace_data)
 
     async def link_trace_to_message(
         self,
@@ -662,12 +730,12 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
         trace_id_str = str(trace_id) if isinstance(trace_id, UUID) else trace_id
         msg_id_str = str(message_id) if isinstance(message_id, UUID) else message_id
 
-        await self._client.execute_write(
-            queries.LINK_TRACE_TO_MESSAGE,
-            {
-                "trace_id": trace_id_str,
-                "message_id": msg_id_str,
-            },
+        await self._client.link_nodes(
+            "ReasoningTrace",
+            trace_id_str,
+            "Message",
+            msg_id_str,
+            "INITIATED_BY",
         )
 
     async def _generate_step_embeddings_batch(self, trace_id: UUID) -> int:
@@ -683,29 +751,30 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
         if self._embedder is None:
             return 0
 
-        # Get all steps without embeddings
-        results = await self._client.execute_read(
-            """
-            MATCH (rt:ReasoningTrace {id: $id})-[:HAS_STEP]->(s:ReasoningStep)
-            WHERE s.embedding IS NULL
-            RETURN s.id AS id, s.thought AS thought, s.action AS action, s.observation AS observation
-            """,
-            {"id": str(trace_id)},
+        # Get all steps via traversal, then filter for missing embeddings
+        all_steps = await self._client.traverse(
+            "ReasoningTrace",
+            str(trace_id),
+            relationship_types=["HAS_STEP"],
+            target_labels=["ReasoningStep"],
+            direction="outgoing",
         )
 
-        if not results:
+        steps_without_embedding = [s for s in all_steps if s.get("embedding") is None]
+
+        if not steps_without_embedding:
             return 0
 
         # Build texts for embedding
         texts = []
         step_ids = []
-        for step in results:
+        for step in steps_without_embedding:
             text_parts = []
-            if step["thought"]:
+            if step.get("thought"):
                 text_parts.append(f"Thought: {step['thought']}")
-            if step["action"]:
+            if step.get("action"):
                 text_parts.append(f"Action: {step['action']}")
-            if step["observation"]:
+            if step.get("observation"):
                 text_parts.append(f"Observation: {step['observation']}")
             if text_parts:
                 texts.append(" ".join(text_parts))
@@ -719,9 +788,10 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
 
         # Batch update steps with embeddings
         for step_id, embedding in zip(step_ids, embeddings):
-            await self._client.execute_write(
-                "MATCH (s:ReasoningStep {id: $id}) SET s.embedding = $embedding",
-                {"id": step_id, "embedding": embedding},
+            await self._client.update_node(
+                "ReasoningStep",
+                step_id,
+                {"embedding": embedding},
             )
 
         return len(step_ids)
@@ -755,33 +825,40 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
 
         task_embedding = await self._embedder.embed(task)
 
-        results = await self._client.execute_read(
-            queries.SEARCH_TRACES_BY_EMBEDDING,
-            {
-                "embedding": task_embedding,
-                "limit": limit,
-                "threshold": threshold,
-                "success_only": success_only,
-            },
+        # Fetch more results than needed to account for client-side filtering
+        fetch_limit = limit * 3 if success_only else limit
+
+        results = await self._client.vector_search(
+            "ReasoningTrace",
+            "task_embedding",
+            task_embedding,
+            limit=fetch_limit,
+            threshold=threshold,
         )
 
         traces = []
         for row in results:
-            trace_data = dict(row["rt"])
+            # Apply success_only filter client-side
+            if success_only and row.get("success") is not True:
+                continue
+
             trace = ReasoningTrace(
-                id=UUID(trace_data["id"]),
-                session_id=trace_data["session_id"],
-                task=trace_data["task"],
-                task_embedding=trace_data.get("task_embedding"),
-                outcome=trace_data.get("outcome"),
-                success=trace_data.get("success"),
-                started_at=_to_python_datetime(trace_data.get("started_at")),
-                completed_at=_to_python_datetime(trace_data.get("completed_at"))
-                if trace_data.get("completed_at")
+                id=UUID(row["id"]),
+                session_id=row["session_id"],
+                task=row["task"],
+                task_embedding=row.get("task_embedding"),
+                outcome=row.get("outcome"),
+                success=row.get("success"),
+                started_at=to_python_datetime(row.get("started_at")),
+                completed_at=to_python_datetime(row.get("completed_at"))
+                if row.get("completed_at")
                 else None,
-                metadata={"similarity": row["score"]},
+                metadata={"similarity": row["_score"]},
             )
             traces.append(trace)
+
+            if len(traces) >= limit:
+                break
 
         return traces
 
@@ -800,12 +877,13 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
         Returns:
             Dictionary of tool name to Tool statistics
         """
-        results = await self._client.execute_read(queries.GET_TOOL_STATS)
+        filters = {"name": tool_name} if tool_name else None
+        results = await self._client.query_nodes("Tool", filters=filters)
 
         tools = {}
         for row in results:
-            name = row["name"]
-            if tool_name and name != tool_name:
+            name = row.get("name") or row.get("id")
+            if not name:
                 continue
 
             tools[name] = Tool(
@@ -840,27 +918,39 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
             # Get stats for a specific tool
             stats = await memory.reasoning.get_tool_stats("search_memory")
         """
-        results = await self._client.execute_read(queries.GET_TOOL_STATS)
+        filters = {"name": tool_name} if tool_name else None
+        results = await self._client.query_nodes(
+            "Tool",
+            filters=filters,
+            order_by="total_calls",
+            order_dir="desc",
+        )
 
         tool_stats = []
         for row in results:
-            name = row["name"]
-            if tool_name and name != tool_name:
+            name = row.get("name") or row.get("id")
+            if not name:
                 continue
 
-            total_calls = row.get("total_calls", 0)
-            success_rate = row.get("success_rate", 0.0)
-            avg_duration = row.get("avg_duration")
+            total_calls = row.get("total_calls", 0) or 0
+            successful_calls = row.get("successful_calls", 0) or 0
+            failed_calls = row.get("failed_calls", 0) or 0
+            total_duration_ms = row.get("total_duration_ms", 0) or 0
+
+            success_rate = (
+                float(successful_calls) / total_calls if total_calls > 0 else 0.0
+            )
+            avg_duration = (
+                float(total_duration_ms) / total_calls if total_calls > 0 else None
+            )
 
             tool_stats.append(
                 ToolStats(
                     name=name,
                     description=row.get("description"),
                     total_calls=total_calls,
-                    successful_calls=int(total_calls * success_rate) if total_calls > 0 else 0,
-                    failed_calls=total_calls - int(total_calls * success_rate)
-                    if total_calls > 0
-                    else 0,
+                    successful_calls=successful_calls,
+                    failed_calls=failed_calls,
                     success_rate=success_rate,
                     avg_duration_ms=avg_duration,
                 )
@@ -886,9 +976,50 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
             for tool, count in migrated.items():
                 print(f"  {tool}: {count} calls")
         """
-        results = await self._client.execute_write(queries.MIGRATE_TOOL_STATS)
+        # Get all Tool nodes
+        tools = await self._client.query_nodes("Tool")
 
-        return {row["name"]: row["migrated_calls"] for row in results}
+        migrated: dict[str, int] = {}
+        for tool_node in tools:
+            tool_name = tool_node.get("name") or tool_node.get("id")
+            if not tool_name:
+                continue
+
+            # Traverse from Tool to its ToolCall nodes via INSTANCE_OF
+            tool_calls = await self._client.traverse(
+                "Tool",
+                tool_name,
+                relationship_types=["INSTANCE_OF"],
+                target_labels=["ToolCall"],
+                direction="incoming",
+            )
+
+            total = len(tool_calls)
+            success = sum(
+                1 for tc in tool_calls if tc.get("status") == "success"
+            )
+            failed = sum(
+                1 for tc in tool_calls
+                if tc.get("status") in ("error", "timeout")
+            )
+            duration = sum(
+                tc.get("duration_ms", 0) or 0 for tc in tool_calls
+            )
+
+            await self._client.update_node(
+                "Tool",
+                tool_name,
+                {
+                    "total_calls": total,
+                    "successful_calls": success,
+                    "failed_calls": failed,
+                    "total_duration_ms": duration,
+                },
+            )
+
+            migrated[tool_name] = total
+
+        return migrated
 
     async def get_context(self, query: str, **kwargs: Any) -> str:
         """
@@ -932,45 +1063,50 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
         Returns:
             Complete reasoning trace or None
         """
-        import json
-
-        results = await self._client.execute_read(
-            queries.GET_TRACE_WITH_STEPS,
-            {"id": str(trace_id)},
+        # 1. Get the trace node
+        trace_data = await self._client.get_node(
+            "ReasoningTrace",
+            id=str(trace_id),
         )
 
-        if not results:
+        if not trace_data:
             return None
 
-        row = results[0]
-        trace_data = dict(row["rt"])
-        steps_data = row.get("steps", [])
-        tool_calls_data = row.get("tool_calls", [])
+        # 2. Get all steps for this trace
+        steps_data = await self._client.traverse(
+            "ReasoningTrace",
+            str(trace_id),
+            relationship_types=["HAS_STEP"],
+            target_labels=["ReasoningStep"],
+            direction="outgoing",
+        )
 
-        # Parse tool calls
-        tool_calls_by_step: dict[str, list[ToolCall]] = {}
-        for tc_data in tool_calls_data:
-            tc = dict(tc_data)
-            step_id = tc.get("step_id")
-            if step_id:
-                if step_id not in tool_calls_by_step:
-                    tool_calls_by_step[step_id] = []
-                tool_calls_by_step[step_id].append(
+        # 3. For each step, get its tool calls
+        steps = []
+        for sd in steps_data:
+            step_id = sd["id"]
+            tc_data = await self._client.traverse(
+                "ReasoningStep",
+                step_id,
+                relationship_types=["USES_TOOL"],
+                target_labels=["ToolCall"],
+                direction="outgoing",
+            )
+
+            step_tool_calls = []
+            for tc in tc_data:
+                step_tool_calls.append(
                     ToolCall(
                         id=UUID(tc["id"]),
                         tool_name=tc["tool_name"],
-                        arguments=json.loads(tc.get("arguments", "{}")),
-                        result=json.loads(tc["result"]) if tc.get("result") else None,
+                        arguments=_deserialize_json(tc.get("arguments")) or {},
+                        result=_deserialize_json(tc.get("result")),
                         status=ToolCallStatus(tc.get("status", "success")),
                         duration_ms=tc.get("duration_ms"),
                         error=tc.get("error"),
                     )
                 )
 
-        # Parse steps
-        steps = []
-        for step_data in steps_data:
-            sd = dict(step_data)
             step = ReasoningStep(
                 id=UUID(sd["id"]),
                 trace_id=trace_id,
@@ -978,7 +1114,7 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
                 thought=sd.get("thought"),
                 action=sd.get("action"),
                 observation=sd.get("observation"),
-                tool_calls=tool_calls_by_step.get(sd["id"], []),
+                tool_calls=step_tool_calls,
             )
             steps.append(step)
 
@@ -993,8 +1129,8 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
             steps=steps,
             outcome=trace_data.get("outcome"),
             success=trace_data.get("success"),
-            started_at=_to_python_datetime(trace_data.get("started_at")),
-            completed_at=_to_python_datetime(trace_data.get("completed_at"))
+            started_at=to_python_datetime(trace_data.get("started_at")),
+            completed_at=to_python_datetime(trace_data.get("completed_at"))
             if trace_data.get("completed_at")
             else None,
         )
@@ -1063,36 +1199,50 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
         Returns:
             List of ReasoningTrace objects (without steps - use get_trace for full details)
         """
-        results = await self._client.execute_read(
-            queries.LIST_TRACES,
-            {
-                "session_id": session_id,
-                "success": success_only,
-                "since": since.isoformat() if since else None,
-                "until": until.isoformat() if until else None,
-                "limit": limit,
-                "offset": offset,
-                "order_by": order_by,
-                "order_dir": order_dir,
-            },
+        # Build equality filters for query_nodes
+        filters: dict[str, Any] = {}
+        if session_id is not None:
+            filters["session_id"] = session_id
+        if success_only is not None:
+            filters["success"] = success_only
+
+        # Fetch more to allow for client-side time filtering
+        fetch_limit = limit
+        if since or until:
+            fetch_limit = (limit + offset) * 3  # Over-fetch to compensate
+
+        results = await self._client.query_nodes(
+            "ReasoningTrace",
+            filters=filters if filters else None,
+            order_by=order_by,
+            order_dir=order_dir,
+            limit=fetch_limit,
+            offset=0 if (since or until) else offset,
         )
 
         traces = []
+        skipped = 0
         for row in results:
-            trace_data = dict(row["rt"])
-            trace = ReasoningTrace(
-                id=UUID(trace_data["id"]),
-                session_id=trace_data["session_id"],
-                task=trace_data["task"],
-                task_embedding=trace_data.get("task_embedding"),
-                outcome=trace_data.get("outcome"),
-                success=trace_data.get("success"),
-                started_at=_to_python_datetime(trace_data.get("started_at")),
-                completed_at=_to_python_datetime(trace_data.get("completed_at"))
-                if trace_data.get("completed_at")
-                else None,
-            )
+            # Client-side time filtering for since/until
+            started_at_val = row.get("started_at")
+            if started_at_val is not None and (since or until):
+                started_at_dt = to_python_datetime(started_at_val)
+                if since and started_at_dt < since:
+                    continue
+                if until and started_at_dt > until:
+                    continue
+
+            # Handle offset for time-filtered results
+            if since or until:
+                if skipped < offset:
+                    skipped += 1
+                    continue
+
+            trace = _trace_from_dict(row)
             traces.append(trace)
+
+            if len(traces) >= limit:
+                break
 
         return traces
 

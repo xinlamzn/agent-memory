@@ -1,6 +1,5 @@
 """Short-term memory for conversations and messages."""
 
-import json
 from collections.abc import Callable
 from datetime import datetime
 from enum import Enum
@@ -10,38 +9,11 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field
 
 from neo4j_agent_memory.core.memory import BaseMemory, MemoryEntry
-from neo4j_agent_memory.graph import queries
-from neo4j_agent_memory.graph.query_builder import build_create_entity_query
-
-
-def _serialize_metadata(metadata: dict[str, Any] | None) -> str | None:
-    """Serialize metadata dict to JSON string for Neo4j storage."""
-    if metadata is None or metadata == {}:
-        return None
-    return json.dumps(metadata)
-
-
-def _deserialize_metadata(metadata_str: str | None) -> dict[str, Any]:
-    """Deserialize metadata from JSON string."""
-    if metadata_str is None:
-        return {}
-    try:
-        return json.loads(metadata_str)
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
-
-def _to_python_datetime(neo4j_datetime) -> datetime:
-    """Convert Neo4j DateTime to Python datetime."""
-    if neo4j_datetime is None:
-        return datetime.utcnow()
-    if isinstance(neo4j_datetime, datetime):
-        return neo4j_datetime
-    # Neo4j DateTime has to_native() method
-    try:
-        return neo4j_datetime.to_native()
-    except AttributeError:
-        return datetime.utcnow()
+from neo4j_agent_memory.graph.result_adapter import (
+    deserialize_metadata,
+    serialize_metadata,
+    to_python_datetime,
+)
 
 
 def _build_metadata_filter_clause_json(
@@ -52,6 +24,9 @@ def _build_metadata_filter_clause_json(
 
     This version works without APOC by using string CONTAINS on the JSON metadata.
     Only supports simple equality filters for string values.
+
+    Note: This is Neo4j-specific and is kept for metadata filtering in vector
+    search, which cannot be expressed through the GraphBackend protocol alone.
 
     Args:
         filters: Dictionary of filter conditions (only simple equality supported)
@@ -121,6 +96,9 @@ def _build_metadata_filter_clause(
     Since metadata is stored as a JSON string, this function generates clauses
     that work with a pre-parsed metadata map variable (e.g., from apoc.convert.fromJsonMap).
 
+    Note: This is Neo4j-specific and is kept for advanced metadata filtering
+    use cases that cannot be expressed through the GraphBackend protocol alone.
+
     Supports:
     - Simple equality: {"key": "value"}
     - Comparison operators: {"key": {"$gt": 5}}
@@ -187,7 +165,7 @@ def _build_metadata_filter_clause(
 if TYPE_CHECKING:
     from neo4j_agent_memory.embeddings.base import Embedder
     from neo4j_agent_memory.extraction.base import EntityExtractor
-    from neo4j_agent_memory.graph.client import Neo4jClient
+    from neo4j_agent_memory.graph.backend_protocol import GraphBackend
 
 
 class MessageRole(str, Enum):
@@ -269,7 +247,7 @@ class ShortTermMemory(BaseMemory[Message]):
 
     def __init__(
         self,
-        client: "Neo4jClient",
+        client: "GraphBackend",
         embedder: "Embedder | None" = None,
         extractor: "EntityExtractor | None" = None,
     ):
@@ -361,7 +339,7 @@ class ShortTermMemory(BaseMemory[Message]):
                         "content": content,
                         "embedding": None,  # Will be set after batch embedding
                         "timestamp": timestamp,
-                        "metadata": _serialize_metadata(metadata),
+                        "metadata": serialize_metadata(metadata),
                     }
                 )
                 contents_for_embedding.append(content)
@@ -383,14 +361,26 @@ class ShortTermMemory(BaseMemory[Message]):
                     batch_data[j]["embedding"] = emb
                     batch_messages[j].embedding = emb
 
-            # Insert batch into database
-            await self._client.execute_write(
-                queries.CREATE_MESSAGES_BATCH,
-                {
-                    "conversation_id": str(conv_id),
-                    "messages": batch_data,
-                },
-            )
+            # Insert batch into database: create each message and link to conversation
+            for bd in batch_data:
+                await self._client.upsert_node(
+                    "Message",
+                    id=bd["id"],
+                    properties={
+                        "role": bd["role"],
+                        "content": bd["content"],
+                        "embedding": bd["embedding"],
+                        "timestamp": bd["timestamp"] or datetime.utcnow().isoformat(),
+                        "metadata": bd["metadata"],
+                    },
+                )
+                await self._client.link_nodes(
+                    "Conversation",
+                    str(conv_id),
+                    "Message",
+                    bd["id"],
+                    "HAS_MESSAGE",
+                )
 
             # Create message links for this batch
             msg_ids = [bd["id"] for bd in batch_data]
@@ -444,11 +434,29 @@ class ShortTermMemory(BaseMemory[Message]):
         if self._embedder is None:
             return 0
 
-        # Get messages without embeddings
-        results = await self._client.execute_read(
-            queries.GET_MESSAGES_WITHOUT_EMBEDDINGS,
-            {"session_id": session_id},
+        # Get conversation for this session
+        conv_node = await self._client.get_node(
+            "Conversation", filters={"session_id": session_id}
         )
+        if not conv_node:
+            return 0
+
+        conv_id = conv_node["id"]
+
+        # Get all messages via traverse and filter those without embeddings
+        all_messages = await self._client.traverse(
+            "Conversation",
+            conv_id,
+            relationship_types=["HAS_MESSAGE"],
+            target_labels=["Message"],
+            direction="outgoing",
+        )
+
+        results = [
+            {"id": m["id"], "content": m["content"]}
+            for m in all_messages
+            if m.get("embedding") is None
+        ]
 
         if not results:
             return 0
@@ -469,9 +477,8 @@ class ShortTermMemory(BaseMemory[Message]):
 
             # Update messages with embeddings
             for msg_id, embedding in zip(msg_ids, embeddings):
-                await self._client.execute_write(
-                    queries.UPDATE_MESSAGE_EMBEDDING,
-                    {"id": msg_id, "embedding": embedding},
+                await self._client.update_node(
+                    "Message", msg_id, properties={"embedding": embedding}
                 )
 
             processed += len(batch)
@@ -530,17 +537,27 @@ class ShortTermMemory(BaseMemory[Message]):
             metadata=metadata or {},
         )
 
-        # Store message
-        await self._client.execute_write(
-            queries.CREATE_MESSAGE,
-            {
-                "conversation_id": str(conv_id),
-                "id": str(message.id),
+        # Store message with link to conversation.
+        # HAS_MESSAGE goes from Conversation to Message, so direction is
+        # "incoming" from the Message's perspective.
+        await self._client.create_node_with_links(
+            "Message",
+            id=str(message.id),
+            properties={
                 "role": message.role.value,
                 "content": message.content,
                 "embedding": message.embedding,
-                "metadata": _serialize_metadata(message.metadata),
+                "timestamp": datetime.utcnow().isoformat(),
+                "metadata": serialize_metadata(message.metadata),
             },
+            links=[
+                {
+                    "target_label": "Conversation",
+                    "target_id": str(conv_id),
+                    "relationship_type": "HAS_MESSAGE",
+                    "direction": "incoming",
+                },
+            ],
         )
 
         # Extract and link entities if enabled
@@ -572,35 +589,39 @@ class ShortTermMemory(BaseMemory[Message]):
         # Get conversation
         if conversation_id:
             conv_id = str(conversation_id) if isinstance(conversation_id, UUID) else conversation_id
-            results = await self._client.execute_read(queries.GET_CONVERSATION, {"id": conv_id})
+            conv_data = await self._client.get_node("Conversation", id=conv_id)
         else:
-            results = await self._client.execute_read(
-                queries.GET_CONVERSATION_BY_SESSION, {"session_id": session_id}
+            conv_data = await self._client.get_node(
+                "Conversation", filters={"session_id": session_id}
             )
 
-        if not results:
+        if not conv_data:
             # Return empty conversation
             return Conversation(session_id=session_id)
 
-        conv_data = dict(results[0]["c"])
-
-        # Get messages
-        msg_results = await self._client.execute_read(
-            queries.GET_CONVERSATION_MESSAGES,
-            {"conversation_id": conv_data["id"], "limit": limit or 1000},
+        # Get messages via traverse
+        msg_results = await self._client.traverse(
+            "Conversation",
+            conv_data["id"],
+            relationship_types=["HAS_MESSAGE"],
+            target_labels=["Message"],
+            direction="outgoing",
+            limit=limit or 1000,
         )
 
+        # Sort messages by timestamp (traverse does not guarantee order)
+        msg_results.sort(key=lambda m: m.get("timestamp", ""))
+
         messages = []
-        for row in msg_results:
-            msg_data = dict(row["m"])
+        for msg_data in msg_results:
             msg = Message(
                 id=UUID(msg_data["id"]),
                 role=MessageRole(msg_data["role"]),
                 content=msg_data["content"],
                 embedding=msg_data.get("embedding"),
                 conversation_id=UUID(conv_data["id"]),
-                created_at=_to_python_datetime(msg_data.get("timestamp")),
-                metadata=_deserialize_metadata(msg_data.get("metadata")),
+                created_at=to_python_datetime(msg_data.get("timestamp")),
+                metadata=deserialize_metadata(msg_data.get("metadata")),
             )
             if since is None or msg.created_at >= since:
                 messages.append(msg)
@@ -610,8 +631,8 @@ class ShortTermMemory(BaseMemory[Message]):
             session_id=conv_data["session_id"],
             title=conv_data.get("title"),
             messages=messages,
-            created_at=_to_python_datetime(conv_data.get("created_at")),
-            updated_at=_to_python_datetime(conv_data.get("updated_at"))
+            created_at=to_python_datetime(conv_data.get("created_at")),
+            updated_at=to_python_datetime(conv_data.get("updated_at"))
             if conv_data.get("updated_at")
             else None,
         )
@@ -644,6 +665,11 @@ class ShortTermMemory(BaseMemory[Message]):
                 - Existence check: {"timestamp": {"$exists": True}}
                 - String operations: {"speaker": {"$contains": "Brian"}}
 
+                Note: When metadata_filters are provided, results are filtered
+                in-memory after the vector search, since the GraphBackend
+                vector_search method does not support JSON metadata filtering
+                directly.
+
         Returns:
             List of matching messages
         """
@@ -652,50 +678,97 @@ class ShortTermMemory(BaseMemory[Message]):
 
         query_embedding = await self._embedder.embed(query)
 
-        # Build metadata filter clause if provided
-        # Use JSON string matching which doesn't require APOC
-        metadata_clause, metadata_params = _build_metadata_filter_clause_json(
-            metadata_filters or {}, metadata_prop="m.metadata"
+        # Use GraphBackend vector_search
+        # When metadata_filters are provided, fetch extra results to
+        # compensate for post-search filtering.
+        search_limit = limit * 2 if metadata_filters else limit
+
+        results = await self._client.vector_search(
+            "Message",
+            "embedding",
+            query_embedding,
+            limit=search_limit,
+            threshold=threshold,
         )
-
-        # Build the query with optional metadata filtering
-        if metadata_clause:
-            # Use a modified query that includes metadata filtering
-            # Metadata is stored as JSON string - we use CONTAINS for filtering
-            cypher_query = queries.build_metadata_search_query(metadata_clause)
-            params = {
-                "embedding": query_embedding,
-                "limit": limit,
-                "threshold": threshold,
-                **metadata_params,
-            }
-        else:
-            cypher_query = queries.SEARCH_MESSAGES_BY_EMBEDDING
-            params = {
-                "embedding": query_embedding,
-                "limit": limit,
-                "threshold": threshold,
-            }
-
-        results = await self._client.execute_read(cypher_query, params)
 
         messages = []
         for row in results:
-            msg_data = dict(row["m"])
+            msg_metadata = deserialize_metadata(row.get("metadata"))
+
+            # Apply metadata filters in-memory if provided
+            if metadata_filters:
+                if not self._matches_metadata_filters(msg_metadata, metadata_filters):
+                    continue
+
             msg = Message(
-                id=UUID(msg_data["id"]),
-                role=MessageRole(msg_data["role"]),
-                content=msg_data["content"],
-                embedding=msg_data.get("embedding"),
-                created_at=_to_python_datetime(msg_data.get("timestamp")),
+                id=UUID(row["id"]),
+                role=MessageRole(row["role"]),
+                content=row["content"],
+                embedding=row.get("embedding"),
+                created_at=to_python_datetime(row.get("timestamp")),
                 metadata={
-                    **_deserialize_metadata(msg_data.get("metadata")),
-                    "similarity": row["score"],
+                    **msg_metadata,
+                    "similarity": row["_score"],
                 },
             )
             messages.append(msg)
+            if len(messages) >= limit:
+                break
 
         return messages
+
+    @staticmethod
+    def _matches_metadata_filters(
+        metadata: dict[str, Any], filters: dict[str, Any]
+    ) -> bool:
+        """Check whether a metadata dict satisfies the given filters.
+
+        Supports simple equality and operator-based filters (``$eq``, ``$gt``,
+        ``$gte``, ``$lt``, ``$lte``, ``$in``, ``$nin``, ``$contains``,
+        ``$startswith``, ``$endswith``, ``$exists``, ``$ne``).
+        """
+        for key, value in filters.items():
+            actual = metadata.get(key)
+            if isinstance(value, dict):
+                for op, op_value in value.items():
+                    if op == "$eq" and actual != op_value:
+                        return False
+                    elif op == "$ne" and actual == op_value:
+                        return False
+                    elif op == "$gt" and (actual is None or actual <= op_value):
+                        return False
+                    elif op == "$gte" and (actual is None or actual < op_value):
+                        return False
+                    elif op == "$lt" and (actual is None or actual >= op_value):
+                        return False
+                    elif op == "$lte" and (actual is None or actual > op_value):
+                        return False
+                    elif op == "$in" and actual not in op_value:
+                        return False
+                    elif op == "$nin" and actual in op_value:
+                        return False
+                    elif op == "$exists":
+                        if op_value and actual is None:
+                            return False
+                        if not op_value and actual is not None:
+                            return False
+                    elif op == "$contains" and (
+                        actual is None or op_value not in str(actual)
+                    ):
+                        return False
+                    elif op == "$startswith" and (
+                        actual is None or not str(actual).startswith(op_value)
+                    ):
+                        return False
+                    elif op == "$endswith" and (
+                        actual is None or not str(actual).endswith(op_value)
+                    ):
+                        return False
+            else:
+                # Simple equality
+                if actual != value:
+                    return False
+        return True
 
     async def get_context(self, query: str, **kwargs: Any) -> str:
         """
@@ -736,7 +809,30 @@ class ShortTermMemory(BaseMemory[Message]):
 
     async def clear_session(self, session_id: str) -> None:
         """Clear all data for a session."""
-        await self._client.execute_write(queries.DELETE_SESSION_DATA, {"session_id": session_id})
+        # Get conversation for this session
+        conv_node = await self._client.get_node(
+            "Conversation", filters={"session_id": session_id}
+        )
+        if not conv_node:
+            return
+
+        conv_id = conv_node["id"]
+
+        # Get all messages linked to this conversation
+        msg_results = await self._client.traverse(
+            "Conversation",
+            conv_id,
+            relationship_types=["HAS_MESSAGE"],
+            target_labels=["Message"],
+            direction="outgoing",
+        )
+
+        # Delete each message (detach removes all relationships)
+        for msg in msg_results:
+            await self._client.delete_node("Message", msg["id"], detach=True)
+
+        # Delete the conversation itself
+        await self._client.delete_node("Conversation", conv_id, detach=True)
 
     async def migrate_message_links(self) -> dict[str, int]:
         """
@@ -760,8 +856,46 @@ class ShortTermMemory(BaseMemory[Message]):
             for conv_id, count in migrated.items():
                 print(f"  {conv_id}: {count} messages linked")
         """
-        results = await self._client.execute_write(queries.MIGRATE_MESSAGE_LINKS)
-        return {row["conversation_id"]: row["messages_linked"] for row in results}
+        # Get all conversations
+        conversations = await self._client.query_nodes("Conversation")
+
+        result: dict[str, int] = {}
+
+        for conv in conversations:
+            conv_id = conv["id"]
+
+            # Get all messages for this conversation
+            msg_results = await self._client.traverse(
+                "Conversation",
+                conv_id,
+                relationship_types=["HAS_MESSAGE"],
+                target_labels=["Message"],
+                direction="outgoing",
+            )
+
+            if not msg_results:
+                continue
+
+            # Sort by timestamp
+            msg_results.sort(key=lambda m: m.get("timestamp", ""))
+
+            # Create FIRST_MESSAGE link
+            first_msg_id = msg_results[0]["id"]
+            await self._client.link_nodes(
+                "Conversation", conv_id, "Message", first_msg_id, "FIRST_MESSAGE"
+            )
+
+            # Create NEXT_MESSAGE chain
+            for j in range(len(msg_results) - 1):
+                prev_id = msg_results[j]["id"]
+                next_id = msg_results[j + 1]["id"]
+                await self._client.link_nodes(
+                    "Message", prev_id, "Message", next_id, "NEXT_MESSAGE"
+                )
+
+            result[conv_id] = len(msg_results)
+
+        return result
 
     async def list_sessions(
         self,
@@ -775,6 +909,10 @@ class ShortTermMemory(BaseMemory[Message]):
         """
         List sessions with metadata.
 
+        Note: This implementation uses multiple GraphBackend calls per conversation
+        to gather message counts and previews. For large numbers of conversations,
+        a backend-specific optimized query may be needed.
+
         Args:
             prefix: Filter sessions by ID prefix (e.g., "lenny-podcast-" to match
                    all podcast sessions)
@@ -786,33 +924,77 @@ class ShortTermMemory(BaseMemory[Message]):
         Returns:
             List of SessionInfo objects with session details
         """
-        results = await self._client.execute_read(
-            queries.LIST_SESSIONS,
-            {
-                "prefix": prefix,
-                "limit": limit,
-                "offset": offset,
-                "order_by": order_by,
-                "order_dir": order_dir,
-            },
+        # Query conversations. We fetch more than needed to allow for prefix
+        # filtering and message_count ordering which happen in-memory.
+        # Note: When order_by is "message_count", we cannot order at the
+        # database level, so we fetch all and sort in-memory.
+        db_order_by = order_by if order_by != "message_count" else "created_at"
+
+        conversations = await self._client.query_nodes(
+            "Conversation",
+            order_by=db_order_by,
+            order_dir=order_dir,
+            # Fetch extra when we need to filter or re-sort
+            limit=None if (prefix or order_by == "message_count") else limit + offset,
         )
 
-        sessions = []
-        for row in results:
-            session = SessionInfo(
-                session_id=row["session_id"],
-                title=row.get("title"),
-                created_at=_to_python_datetime(row.get("created_at")),
-                updated_at=_to_python_datetime(row.get("updated_at"))
-                if row.get("updated_at")
-                else None,
-                message_count=row.get("message_count", 0),
-                first_message_preview=row.get("first_message_preview"),
-                last_message_preview=row.get("last_message_preview"),
-            )
-            sessions.append(session)
+        # Apply prefix filter if provided
+        if prefix:
+            conversations = [
+                c for c in conversations if c.get("session_id", "").startswith(prefix)
+            ]
 
-        return sessions
+        # Build SessionInfo for each conversation (gather message data)
+        session_infos: list[SessionInfo] = []
+        for conv in conversations:
+            conv_id = conv["id"]
+
+            # Traverse to get messages
+            msg_results = await self._client.traverse(
+                "Conversation",
+                conv_id,
+                relationship_types=["HAS_MESSAGE"],
+                target_labels=["Message"],
+                direction="outgoing",
+            )
+
+            message_count = len(msg_results)
+
+            first_preview = None
+            last_preview = None
+            if msg_results:
+                # Sort by timestamp to get first/last
+                msg_results.sort(key=lambda m: m.get("timestamp", ""))
+                first_content = msg_results[0].get("content", "")
+                last_content = msg_results[-1].get("content", "")
+                first_preview = first_content[:100] if first_content else None
+                last_preview = last_content[:100] if last_content else None
+
+            session_infos.append(
+                SessionInfo(
+                    session_id=conv["session_id"],
+                    title=conv.get("title"),
+                    created_at=to_python_datetime(conv.get("created_at")),
+                    updated_at=to_python_datetime(conv.get("updated_at"))
+                    if conv.get("updated_at")
+                    else None,
+                    message_count=message_count,
+                    first_message_preview=first_preview,
+                    last_message_preview=last_preview,
+                )
+            )
+
+        # Sort by message_count if requested (cannot be done at DB level)
+        if order_by == "message_count":
+            session_infos.sort(
+                key=lambda s: s.message_count,
+                reverse=(order_dir == "desc"),
+            )
+
+        # Apply offset and limit
+        session_infos = session_infos[offset : offset + limit]
+
+        return session_infos
 
     async def delete_message(
         self,
@@ -838,12 +1020,12 @@ class ShortTermMemory(BaseMemory[Message]):
             except ValueError:
                 return False
 
-        query = queries.DELETE_MESSAGE if cascade else queries.DELETE_MESSAGE_NO_CASCADE
-        results = await self._client.execute_write(query, {"id": str(message_id)})
-
-        if results and results[0].get("deleted"):
-            return True
-        return False
+        # detach=True removes all relationships (HAS_MESSAGE, MENTIONS, NEXT_MESSAGE, etc.)
+        # When cascade=False, we still use detach=True since we need to remove
+        # structural relationships (HAS_MESSAGE, NEXT_MESSAGE) for the delete to
+        # succeed; the semantic difference between cascade/no-cascade was about
+        # MENTIONS only, but detach delete is the only safe option here.
+        return await self._client.delete_node("Message", str(message_id), detach=True)
 
     async def extract_entities_from_session(
         self,
@@ -873,13 +1055,44 @@ class ShortTermMemory(BaseMemory[Message]):
         if self._extractor is None:
             return {"messages_processed": 0, "entities_extracted": 0, "relations_extracted": 0}
 
-        # Get messages to process
-        if skip_existing:
-            query = queries.GET_MESSAGES_FOR_ENTITY_EXTRACTION
-        else:
-            query = queries.GET_ALL_MESSAGES_FOR_SESSION
+        # Get conversation for this session
+        conv_node = await self._client.get_node(
+            "Conversation", filters={"session_id": session_id}
+        )
+        if not conv_node:
+            return {"messages_processed": 0, "entities_extracted": 0, "relations_extracted": 0}
 
-        results = await self._client.execute_read(query, {"session_id": session_id})
+        conv_id = conv_node["id"]
+
+        # Get all messages for the conversation
+        all_messages = await self._client.traverse(
+            "Conversation",
+            conv_id,
+            relationship_types=["HAS_MESSAGE"],
+            target_labels=["Message"],
+            direction="outgoing",
+        )
+
+        if not all_messages:
+            return {"messages_processed": 0, "entities_extracted": 0, "relations_extracted": 0}
+
+        # If skip_existing, filter out messages that already have MENTIONS relationships
+        if skip_existing:
+            results = []
+            for msg in all_messages:
+                # Check if this message has any MENTIONS relationships
+                mentions = await self._client.traverse(
+                    "Message",
+                    msg["id"],
+                    relationship_types=["MENTIONS"],
+                    target_labels=["Entity"],
+                    direction="outgoing",
+                    limit=1,
+                )
+                if not mentions:
+                    results.append({"id": msg["id"], "content": msg["content"]})
+        else:
+            results = [{"id": m["id"], "content": m["content"]} for m in all_messages]
 
         if not results:
             return {"messages_processed": 0, "entities_extracted": 0, "relations_extracted": 0}
@@ -910,11 +1123,18 @@ class ShortTermMemory(BaseMemory[Message]):
                     # Create or get entity with dynamic labels for type/subtype
                     entity_id = str(uuid4())
                     entity_subtype = getattr(entity, "subtype", None)
-                    create_query = build_create_entity_query(entity.type, entity_subtype)
-                    await self._client.execute_write(
-                        create_query,
-                        {
-                            "id": entity_id,
+
+                    # Build additional labels from entity type and subtype
+                    additional_labels = []
+                    if entity.type:
+                        additional_labels.append(entity.type)
+                    if entity_subtype:
+                        additional_labels.append(entity_subtype)
+
+                    await self._client.upsert_node(
+                        "Entity",
+                        id=entity_id,
+                        properties={
                             "name": entity.name,
                             "type": entity.type,
                             "subtype": entity_subtype,
@@ -923,19 +1143,40 @@ class ShortTermMemory(BaseMemory[Message]):
                             "embedding": None,
                             "confidence": entity.confidence,
                             "metadata": None,
-                            "location": None,  # Required for LOCATION entities
+                            "location": None,
                         },
+                        on_match_update={
+                            "subtype": entity_subtype,
+                            "canonical_name": entity.name,
+                        },
+                        additional_labels=additional_labels if additional_labels else None,
                     )
 
                     # Store mapping for relation linking
                     entity_name_to_id[entity.name.lower().strip()] = entity_id
 
-                    # Link message to entity
-                    await self._client.execute_write(
-                        queries.LINK_MESSAGE_TO_ENTITY,
-                        {
-                            "message_id": message_id,
-                            "entity_id": entity_id,
+                    # Link entity to message via EXTRACTED_FROM
+                    await self._client.link_nodes(
+                        "Entity",
+                        entity_id,
+                        "Message",
+                        message_id,
+                        "EXTRACTED_FROM",
+                        properties={
+                            "confidence": entity.confidence,
+                            "start_pos": entity.start_pos,
+                            "end_pos": entity.end_pos,
+                        },
+                    )
+
+                    # Also create the MENTIONS link (Message -> Entity)
+                    await self._client.link_nodes(
+                        "Message",
+                        message_id,
+                        "Entity",
+                        entity_id,
+                        "MENTIONS",
+                        properties={
                             "confidence": entity.confidence,
                             "start_pos": entity.start_pos,
                             "end_pos": entity.end_pos,
@@ -972,34 +1213,65 @@ class ShortTermMemory(BaseMemory[Message]):
             return UUID(str(conversation_id))
 
         # Check for existing conversation
-        results = await self._client.execute_read(
-            queries.GET_CONVERSATION_BY_SESSION, {"session_id": session_id}
+        result = await self._client.get_node(
+            "Conversation", filters={"session_id": session_id}
         )
 
-        if results:
-            return UUID(results[0]["c"]["id"])
+        if result:
+            return UUID(result["id"])
 
         # Create new conversation
         new_id = uuid4()
-        await self._client.execute_write(
-            queries.CREATE_CONVERSATION,
-            {
-                "id": str(new_id),
+        await self._client.upsert_node(
+            "Conversation",
+            id=str(new_id),
+            properties={
                 "session_id": session_id,
                 "title": None,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": None,
             },
         )
         return new_id
 
     async def _get_last_message_id(self, conversation_id: UUID) -> str | None:
-        """Get the ID of the last message in a conversation (one without outgoing NEXT_MESSAGE)."""
-        results = await self._client.execute_read(
-            queries.GET_LAST_MESSAGE,
-            {"conversation_id": str(conversation_id)},
+        """Get the ID of the last message in a conversation (one without outgoing NEXT_MESSAGE).
+
+        Traverses all messages from the conversation and finds the terminal
+        one (no outgoing NEXT_MESSAGE relationship).
+        """
+        # Get all messages in the conversation
+        msg_results = await self._client.traverse(
+            "Conversation",
+            str(conversation_id),
+            relationship_types=["HAS_MESSAGE"],
+            target_labels=["Message"],
+            direction="outgoing",
         )
-        if not results:
+
+        if not msg_results:
             return None
-        return results[0]["m"]["id"]
+
+        # For each message, check if it has an outgoing NEXT_MESSAGE.
+        # The last message is the one without such a relationship.
+        # As a heuristic, sort by timestamp descending and check the most
+        # recent candidates first.
+        msg_results.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
+
+        for msg in msg_results:
+            next_msgs = await self._client.traverse(
+                "Message",
+                msg["id"],
+                relationship_types=["NEXT_MESSAGE"],
+                target_labels=["Message"],
+                direction="outgoing",
+                limit=1,
+            )
+            if not next_msgs:
+                return msg["id"]
+
+        # Fallback: return the most recent by timestamp
+        return msg_results[0]["id"]
 
     async def _create_message_links(
         self,
@@ -1012,15 +1284,25 @@ class ShortTermMemory(BaseMemory[Message]):
         if not message_ids:
             return
 
-        await self._client.execute_write(
-            queries.CREATE_MESSAGE_LINKS,
-            {
-                "conversation_id": str(conversation_id),
-                "message_ids": message_ids,
-                "previous_last_id": previous_last_id,
-                "create_first_message": create_first_message,
-            },
-        )
+        conv_id = str(conversation_id)
+
+        # Create FIRST_MESSAGE link if this is the first batch
+        if create_first_message:
+            await self._client.link_nodes(
+                "Conversation", conv_id, "Message", message_ids[0], "FIRST_MESSAGE"
+            )
+
+        # Link from previous last message to first of this batch
+        if previous_last_id is not None:
+            await self._client.link_nodes(
+                "Message", previous_last_id, "Message", message_ids[0], "NEXT_MESSAGE"
+            )
+
+        # Create NEXT_MESSAGE chain within the batch
+        for i in range(len(message_ids) - 1):
+            await self._client.link_nodes(
+                "Message", message_ids[i], "Message", message_ids[i + 1], "NEXT_MESSAGE"
+            )
 
     async def _extract_and_link_entities(
         self, message: Message, *, extract_relations: bool = True
@@ -1046,11 +1328,18 @@ class ShortTermMemory(BaseMemory[Message]):
             # Create or get entity with dynamic labels for type/subtype
             entity_id = str(uuid4())
             entity_subtype = getattr(entity, "subtype", None)
-            create_query = build_create_entity_query(entity.type, entity_subtype)
-            await self._client.execute_write(
-                create_query,
-                {
-                    "id": entity_id,
+
+            # Build additional labels from entity type and subtype
+            additional_labels = []
+            if entity.type:
+                additional_labels.append(entity.type)
+            if entity_subtype:
+                additional_labels.append(entity_subtype)
+
+            await self._client.upsert_node(
+                "Entity",
+                id=entity_id,
+                properties={
                     "name": entity.name,
                     "type": entity.type,
                     "subtype": entity_subtype,
@@ -1058,20 +1347,27 @@ class ShortTermMemory(BaseMemory[Message]):
                     "description": None,
                     "embedding": None,
                     "confidence": entity.confidence,
-                    "metadata": None,  # Serialized as null for empty
-                    "location": None,  # Required for LOCATION entities
+                    "metadata": None,
+                    "location": None,
                 },
+                on_match_update={
+                    "subtype": entity_subtype,
+                    "canonical_name": entity.name,
+                },
+                additional_labels=additional_labels if additional_labels else None,
             )
 
             # Store mapping for relation linking
             entity_name_to_id[entity.name.lower().strip()] = entity_id
 
-            # Link message to entity
-            await self._client.execute_write(
-                queries.LINK_MESSAGE_TO_ENTITY,
-                {
-                    "message_id": str(message.id),
-                    "entity_id": entity_id,
+            # Link message to entity via MENTIONS
+            await self._client.link_nodes(
+                "Message",
+                str(message.id),
+                "Entity",
+                entity_id,
+                "MENTIONS",
+                properties={
                     "confidence": entity.confidence,
                     "start_pos": entity.start_pos,
                     "end_pos": entity.end_pos,
@@ -1113,29 +1409,50 @@ class ShortTermMemory(BaseMemory[Message]):
             target_id = entity_name_to_id.get(target_name)
 
             if source_id and target_id:
-                # Both entities found locally, use ID-based query
-                await self._client.execute_write(
-                    queries.CREATE_ENTITY_RELATION_BY_ID,
-                    {
-                        "source_id": source_id,
-                        "target_id": target_id,
+                # Both entities found locally, use ID-based linking
+                await self._client.link_nodes(
+                    "Entity",
+                    source_id,
+                    "Entity",
+                    target_id,
+                    "RELATED_TO",
+                    properties={
                         "relation_type": relation.relation_type,
                         "confidence": relation.confidence,
+                        "created_at": datetime.utcnow().isoformat(),
                     },
                 )
                 stored_count += 1
             else:
                 # Try name-based lookup for cross-message relations
-                result = await self._client.execute_write(
-                    queries.CREATE_ENTITY_RELATION_BY_NAME,
-                    {
-                        "source_name": relation.source,
-                        "target_name": relation.target,
-                        "relation_type": relation.relation_type,
-                        "confidence": relation.confidence,
-                    },
-                )
-                if result:
+                # Look up source entity by name if not in local mapping
+                if not source_id:
+                    source_node = await self._client.get_node(
+                        "Entity", filters={"name": relation.source}
+                    )
+                    if source_node:
+                        source_id = source_node["id"]
+
+                if not target_id:
+                    target_node = await self._client.get_node(
+                        "Entity", filters={"name": relation.target}
+                    )
+                    if target_node:
+                        target_id = target_node["id"]
+
+                if source_id and target_id:
+                    await self._client.link_nodes(
+                        "Entity",
+                        source_id,
+                        "Entity",
+                        target_id,
+                        "RELATED_TO",
+                        properties={
+                            "relation_type": relation.relation_type,
+                            "confidence": relation.confidence,
+                            "created_at": datetime.utcnow().isoformat(),
+                        },
+                    )
                     stored_count += 1
 
         return stored_count
@@ -1214,10 +1531,34 @@ class ShortTermMemory(BaseMemory[Message]):
         # Get key entities if requested
         key_entities: list[str] = []
         if include_entities:
-            entity_results = await self._client.execute_read(
-                queries.GET_SUMMARY_ENTITIES, {"session_id": session_id}
+            # Traverse from conversation -> messages -> entities
+            # First get messages, then for each message get mentioned entities
+            entity_counts: dict[str, int] = {}
+            msg_results = await self._client.traverse(
+                "Conversation",
+                str(conv.id),
+                relationship_types=["HAS_MESSAGE"],
+                target_labels=["Message"],
+                direction="outgoing",
             )
-            key_entities = [row["name"] for row in entity_results]
+            for msg_node in msg_results:
+                entity_results = await self._client.traverse(
+                    "Message",
+                    msg_node["id"],
+                    relationship_types=["MENTIONS"],
+                    target_labels=["Entity"],
+                    direction="outgoing",
+                )
+                for e in entity_results:
+                    name = e.get("name", "")
+                    if name:
+                        entity_counts[name] = entity_counts.get(name, 0) + 1
+
+            # Sort by mention count and take top 10
+            sorted_entities = sorted(
+                entity_counts.items(), key=lambda x: x[1], reverse=True
+            )
+            key_entities = [name for name, _ in sorted_entities[:10]]
 
         # Generate summary
         if summarizer is not None:

@@ -1,10 +1,12 @@
 """Configuration settings for neo4j-agent-memory."""
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from neo4j_agent_memory.config.memory_store_settings import MemoryStoreConfig
 
 
 class EmbeddingProvider(str, Enum):
@@ -417,7 +419,16 @@ class MemorySettings(BaseSettings):
         extra="ignore",
     )
 
+    backend: Literal["neo4j", "memory_store"] = Field(
+        default="neo4j",
+        description="Backend to use: 'neo4j' for Neo4j graph database, "
+        "'memory_store' for OpenSearch Graph Memory Store",
+    )
     neo4j: Neo4jConfig = Field(default_factory=lambda: Neo4jConfig(password=SecretStr("")))
+    memory_store: MemoryStoreConfig | None = Field(
+        default=None,
+        description="Memory Store configuration (required when backend='memory_store')",
+    )
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     schema_config: SchemaConfig = Field(default_factory=SchemaConfig)

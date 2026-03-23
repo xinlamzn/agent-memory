@@ -104,6 +104,15 @@ class MemoryGraph(BaseModel):
     )
 
 
+from neo4j_agent_memory.graph.backend_factory import create_backend_bundle
+from neo4j_agent_memory.graph.backend_protocol import (
+    BackendBundle,
+    BackendCapabilities,
+    GraphBackend,
+    SchemaBackend,
+    UnsupportedBackendOperation,
+    UtilityBackend,
+)
 from neo4j_agent_memory.graph.client import Neo4jClient
 from neo4j_agent_memory.graph.schema import SchemaManager
 
@@ -231,7 +240,14 @@ __all__ = [
     # Base classes
     "BaseMemory",
     "MemoryEntry",
-    # Graph
+    # Graph - backend-neutral
+    "GraphBackend",
+    "SchemaBackend",
+    "UtilityBackend",
+    "BackendBundle",
+    "BackendCapabilities",
+    "UnsupportedBackendOperation",
+    # Graph - Neo4j-specific (backend implementation detail)
     "Neo4jClient",
     "SchemaManager",
     # Graph Export
@@ -292,6 +308,8 @@ class MemoryClient:
             enrichment_provider: Optional enrichment provider override (for testing)
         """
         self._settings = settings or MemorySettings()
+        self._bundle: BackendBundle | None = None
+        # Legacy direct references kept for backward compat
         self._client: Neo4jClient | None = None
         self._schema_manager: SchemaManager | None = None
         self._embedder_override = embedder
@@ -322,21 +340,29 @@ class MemoryClient:
 
     async def connect(self) -> None:
         """
-        Connect to Neo4j and initialize memory stores.
+        Connect to the configured backend and initialize memory stores.
 
         This sets up the database connection, creates necessary indexes
         and constraints, and initializes all memory type instances.
+
+        The backend is selected by ``settings.backend`` (default: "neo4j").
         """
-        # Create Neo4j client
-        self._client = Neo4jClient(self._settings.neo4j)
-        await self._client.connect()
+        # Create backend bundle via factory
+        self._bundle = create_backend_bundle(self._settings)
+
+        # Connect the graph backend
+        await self._bundle.graph.connect()
 
         # Set up schema
-        self._schema_manager = SchemaManager(
-            self._client,
-            vector_dimensions=self._settings.embedding.dimensions,
-        )
-        await self._schema_manager.setup_all()
+        await self._bundle.schema.setup_all()
+
+        # Keep legacy references for backward compatibility
+        if self._bundle.backend_name == "neo4j":
+            self._client = self._bundle.raw
+            self._schema_manager = SchemaManager(
+                self._client,
+                vector_dimensions=self._settings.embedding.dimensions,
+            )
 
         # Initialize embedder (use override if provided)
         self._embedder = self._embedder_override or self._create_embedder()
@@ -356,14 +382,14 @@ class MemoryClient:
         )
         self._enrichment_service = await self._create_enrichment_service()
 
-        # Create memory instances
+        # Create memory instances using the backend-neutral GraphBackend.
         self._short_term = ShortTermMemory(
-            self._client,
+            self._bundle.graph,
             self._embedder,
             self._extractor,
         )
         self._long_term = LongTermMemory(
-            self._client,
+            self._bundle.graph,
             self._embedder,
             self._extractor,
             self._resolver,
@@ -371,25 +397,28 @@ class MemoryClient:
             self._enrichment_service,
         )
         self._reasoning = ReasoningMemory(
-            self._client,
+            self._bundle.graph,
             self._embedder,
         )
 
     async def close(self) -> None:
-        """Close the Neo4j connection and stop background services."""
+        """Close the backend connection and stop background services."""
         # Stop enrichment service gracefully
         if self._enrichment_service is not None:
             await self._enrichment_service.stop()
             self._enrichment_service = None
 
-        if self._client is not None:
-            await self._client.close()
+        if self._bundle is not None:
+            await self._bundle.graph.close()
+            self._bundle = None
             self._client = None
 
     @property
     def is_connected(self) -> bool:
         """Check if client is connected."""
-        return self._client is not None and self._client.is_connected
+        if self._bundle is not None:
+            return self._bundle.graph.is_connected
+        return False
 
     @property
     def short_term(self) -> ShortTermMemory:
@@ -437,19 +466,23 @@ class MemoryClient:
         return self._reasoning
 
     @property
-    def schema(self) -> SchemaManager:
+    def schema(self) -> "SchemaBackend | SchemaManager":
         """
-        Access schema manager for database schema operations.
+        Access the schema backend for database schema operations.
+
+        For ``backend="neo4j"``, also returns a ``SchemaManager``-compatible
+        object.  For other backends, returns the backend-neutral
+        ``SchemaBackend``.
 
         Returns:
-            SchemaManager instance
+            SchemaBackend instance
 
         Raises:
             NotConnectedError: If client is not connected
         """
-        if self._schema_manager is None:
+        if self._bundle is None:
             raise NotConnectedError("Client not connected. Use 'async with' or call connect().")
-        return self._schema_manager
+        return self._bundle.schema
 
     @property
     def graph(self) -> "Neo4jClient":
@@ -463,6 +496,12 @@ class MemoryClient:
         The returned client provides ``execute_read()``, ``execute_write()``,
         ``vector_search()``, and other query methods.
 
+        .. note::
+
+            This property is only available when ``backend="neo4j"``.
+            For the ``memory_store`` backend, raw query access is not supported.
+            Use ``client.neo4j`` as a clearer alternative.
+
         Example::
 
             async with MemoryClient(settings) as client:
@@ -475,10 +514,64 @@ class MemoryClient:
 
         Raises:
             NotConnectedError: If client is not connected
+            UnsupportedBackendOperation: If the backend does not support
+                raw Cypher queries.
         """
-        if self._client is None:
+        if self._bundle is None:
             raise NotConnectedError("Client not connected. Use 'async with' or call connect().")
+        if self._client is None:
+            raise UnsupportedBackendOperation(
+                "graph (raw Cypher access)",
+                self._bundle.backend_name,
+                hint="Raw Cypher queries are only available with backend='neo4j'. "
+                "Use the backend-neutral API methods instead.",
+            )
         return self._client
+
+    @property
+    def neo4j(self) -> "Neo4jClient":
+        """
+        Access the underlying Neo4j client (explicit Neo4j-only property).
+
+        Prefer this over ``client.graph`` to make the Neo4j dependency
+        explicit in your code.
+
+        Returns:
+            Neo4jClient instance
+
+        Raises:
+            NotConnectedError: If client is not connected
+            UnsupportedBackendOperation: If the backend is not Neo4j.
+        """
+        return self.graph
+
+    @property
+    def backend(self) -> BackendBundle:
+        """
+        Access the full backend bundle.
+
+        Returns:
+            BackendBundle with graph, schema, utility, and capabilities.
+
+        Raises:
+            NotConnectedError: If client is not connected
+        """
+        if self._bundle is None:
+            raise NotConnectedError("Client not connected. Use 'async with' or call connect().")
+        return self._bundle
+
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        """
+        Query the current backend's capability flags.
+
+        Returns:
+            BackendCapabilities with feature flags.
+
+        Raises:
+            NotConnectedError: If client is not connected
+        """
+        return self.backend.capabilities
 
     async def get_context(
         self,
@@ -543,22 +636,10 @@ class MemoryClient:
         Returns:
             Dictionary with counts for each memory type
         """
-        if self._client is None:
+        if self._bundle is None:
             raise NotConnectedError("Client not connected.")
 
-        from neo4j_agent_memory.graph.queries import GET_MEMORY_STATS
-
-        results = await self._client.execute_read(GET_MEMORY_STATS)
-        if results:
-            return results[0]
-        return {
-            "conversations": 0,
-            "messages": 0,
-            "entities": 0,
-            "preferences": 0,
-            "facts": 0,
-            "traces": 0,
-        }
+        return await self._bundle.utility.get_stats()
 
     async def get_graph(
         self,
@@ -589,234 +670,42 @@ class MemoryClient:
         Returns:
             MemoryGraph with nodes, relationships, and metadata
         """
-        if self._client is None:
+        if self._bundle is None:
             raise NotConnectedError("Client not connected.")
 
-        if memory_types is None:
-            memory_types = ["short_term", "long_term", "reasoning"]
+        raw = await self._bundle.utility.get_graph(
+            memory_types=memory_types,
+            session_id=session_id,
+            since=since,
+            until=until,
+            include_embeddings=include_embeddings,
+            limit=limit,
+        )
 
-        all_nodes: list[GraphNode] = []
-        all_relationships: list[GraphRelationship] = []
-        node_ids_seen: set[str] = set()
-
-        params = {
-            "session_id": session_id,
-            "since": since.isoformat() if since else None,
-            "until": until.isoformat() if until else None,
-            "include_embeddings": include_embeddings,
-            "limit": limit,
-        }
-
-        # Fetch short-term memory graph
-        if "short_term" in memory_types:
-            try:
-                results = await self._client.execute_read(
-                    """
-                    MATCH (c:Conversation)-[r:HAS_MESSAGE]->(m:Message)
-                    WHERE ($session_id IS NULL OR c.session_id = $session_id)
-                    WITH c, r, m
-                    LIMIT $limit
-                    RETURN c, r, m
-                    """,
-                    params,
-                )
-                for row in results:
-                    conv = dict(row["c"])
-                    msg = dict(row["m"])
-
-                    # Add conversation node
-                    if conv.get("id") and conv["id"] not in node_ids_seen:
-                        props = {k: v for k, v in conv.items() if v is not None}
-                        all_nodes.append(
-                            GraphNode(
-                                id=conv["id"],
-                                labels=["Conversation"],
-                                properties=props,
-                            )
-                        )
-                        node_ids_seen.add(conv["id"])
-
-                    # Add message node
-                    if msg.get("id") and msg["id"] not in node_ids_seen:
-                        props = {k: v for k, v in msg.items() if v is not None}
-                        if not include_embeddings:
-                            props.pop("embedding", None)
-                        all_nodes.append(
-                            GraphNode(
-                                id=msg["id"],
-                                labels=["Message"],
-                                properties=props,
-                            )
-                        )
-                        node_ids_seen.add(msg["id"])
-
-                    # Add relationship
-                    if conv.get("id") and msg.get("id"):
-                        all_relationships.append(
-                            GraphRelationship(
-                                id=f"{conv['id']}->{msg['id']}",
-                                type="HAS_MESSAGE",
-                                from_node=conv["id"],
-                                to_node=msg["id"],
-                                properties={},
-                            )
-                        )
-            except Exception:
-                pass  # Skip if query fails
-
-        # Fetch long-term memory graph
-        if "long_term" in memory_types:
-            try:
-                results = await self._client.execute_read(
-                    """
-                    MATCH (e:Entity)
-                    WITH e LIMIT $limit
-                    OPTIONAL MATCH (e)-[r:RELATED_TO]-(e2:Entity)
-                    RETURN e, r, e2
-                    """,
-                    {"limit": limit},
-                )
-                for row in results:
-                    entity = dict(row["e"])
-
-                    if entity.get("id") and entity["id"] not in node_ids_seen:
-                        props = {k: v for k, v in entity.items() if v is not None}
-                        if not include_embeddings:
-                            props.pop("embedding", None)
-                        all_nodes.append(
-                            GraphNode(
-                                id=entity["id"],
-                                labels=["Entity"],
-                                properties=props,
-                            )
-                        )
-                        node_ids_seen.add(entity["id"])
-
-                    if row.get("r") and row.get("e2"):
-                        e2 = dict(row["e2"])
-                        if e2.get("id") and e2["id"] not in node_ids_seen:
-                            props = {k: v for k, v in e2.items() if v is not None}
-                            if not include_embeddings:
-                                props.pop("embedding", None)
-                            all_nodes.append(
-                                GraphNode(
-                                    id=e2["id"],
-                                    labels=["Entity"],
-                                    properties=props,
-                                )
-                            )
-                            node_ids_seen.add(e2["id"])
-
-                        rel = dict(row["r"])
-                        all_relationships.append(
-                            GraphRelationship(
-                                id=f"{entity['id']}->{e2['id']}",
-                                type=rel.get("type", "RELATED_TO"),
-                                from_node=entity["id"],
-                                to_node=e2["id"],
-                                properties={
-                                    k: v for k, v in rel.items() if k != "type" and v is not None
-                                },
-                            )
-                        )
-            except Exception:
-                pass
-
-        # Fetch reasoning memory graph
-        if "reasoning" in memory_types:
-            try:
-                results = await self._client.execute_read(
-                    """
-                    MATCH (rt:ReasoningTrace)
-                    WHERE ($session_id IS NULL OR rt.session_id = $session_id)
-                    WITH rt LIMIT $limit
-                    OPTIONAL MATCH (rt)-[r1:HAS_STEP]->(rs:ReasoningStep)
-                    OPTIONAL MATCH (rs)-[r2:USES_TOOL]->(tc:ToolCall)
-                    RETURN rt, r1, rs, r2, tc
-                    """,
-                    params,
-                )
-                for row in results:
-                    trace = dict(row["rt"])
-
-                    if trace.get("id") and trace["id"] not in node_ids_seen:
-                        props = {k: v for k, v in trace.items() if v is not None}
-                        if not include_embeddings:
-                            props.pop("task_embedding", None)
-                        all_nodes.append(
-                            GraphNode(
-                                id=trace["id"],
-                                labels=["ReasoningTrace"],
-                                properties=props,
-                            )
-                        )
-                        node_ids_seen.add(trace["id"])
-
-                    if row.get("rs"):
-                        step = dict(row["rs"])
-                        if step.get("id") and step["id"] not in node_ids_seen:
-                            props = {k: v for k, v in step.items() if v is not None}
-                            if not include_embeddings:
-                                props.pop("embedding", None)
-                            all_nodes.append(
-                                GraphNode(
-                                    id=step["id"],
-                                    labels=["ReasoningStep"],
-                                    properties=props,
-                                )
-                            )
-                            node_ids_seen.add(step["id"])
-
-                        if trace.get("id") and step.get("id"):
-                            all_relationships.append(
-                                GraphRelationship(
-                                    id=f"{trace['id']}->{step['id']}",
-                                    type="HAS_STEP",
-                                    from_node=trace["id"],
-                                    to_node=step["id"],
-                                    properties={},
-                                )
-                            )
-
-                    if row.get("tc") and row.get("rs"):
-                        tc = dict(row["tc"])
-                        step = dict(row["rs"])
-                        if tc.get("id") and tc["id"] not in node_ids_seen:
-                            props = {k: v for k, v in tc.items() if v is not None}
-                            all_nodes.append(
-                                GraphNode(
-                                    id=tc["id"],
-                                    labels=["ToolCall"],
-                                    properties=props,
-                                )
-                            )
-                            node_ids_seen.add(tc["id"])
-
-                        if step.get("id") and tc.get("id"):
-                            all_relationships.append(
-                                GraphRelationship(
-                                    id=f"{step['id']}->{tc['id']}",
-                                    type="USES_TOOL",
-                                    from_node=step["id"],
-                                    to_node=tc["id"],
-                                    properties={},
-                                )
-                            )
-            except Exception:
-                pass
+        # Convert raw dicts to Pydantic models for the public API
+        nodes = [
+            GraphNode(
+                id=n["id"],
+                labels=n.get("labels", []),
+                properties=n.get("properties", {}),
+            )
+            for n in raw.get("nodes", [])
+        ]
+        relationships = [
+            GraphRelationship(
+                id=r["id"],
+                type=r.get("type", ""),
+                from_node=r.get("from_node", ""),
+                to_node=r.get("to_node", ""),
+                properties=r.get("properties", {}),
+            )
+            for r in raw.get("relationships", [])
+        ]
 
         return MemoryGraph(
-            nodes=all_nodes,
-            relationships=all_relationships,
-            metadata={
-                "memory_types": memory_types,
-                "session_id": session_id,
-                "since": since.isoformat() if since else None,
-                "until": until.isoformat() if until else None,
-                "include_embeddings": include_embeddings,
-                "node_count": len(all_nodes),
-                "relationship_count": len(all_relationships),
-            },
+            nodes=nodes,
+            relationships=relationships,
+            metadata=raw.get("metadata", {}),
         )
 
     async def get_locations(
@@ -853,77 +742,14 @@ class MemoryClient:
                 - longitude: Longitude coordinate
                 - conversations: List of conversations mentioning this location
         """
-        if self._client is None:
+        if self._bundle is None:
             raise NotConnectedError("Client not connected.")
 
-        # Build the query based on whether session_id filtering is needed
-        if session_id:
-            # Filter to locations mentioned in the specific conversation
-            # EXTRACTED_FROM direction: (Entity)-[:EXTRACTED_FROM]->(Message)
-            query = """
-                MATCH (e:Entity {type: 'LOCATION'})-[:EXTRACTED_FROM]->(m:Message)<-[:HAS_MESSAGE]-(c:Conversation {session_id: $session_id})
-                WITH DISTINCT e
-                WHERE $has_coordinates = false OR (e.location.latitude IS NOT NULL AND e.location.longitude IS NOT NULL)
-                WITH e LIMIT $limit
-                OPTIONAL MATCH (e)-[:EXTRACTED_FROM]->(m2:Message)<-[:HAS_MESSAGE]-(c2:Conversation)
-                WITH e, collect(DISTINCT {id: c2.id, title: c2.title, session_id: c2.session_id}) as conversations
-                RETURN e.id as id,
-                       e.name as name,
-                       e.subtype as subtype,
-                       e.description as description,
-                       e.enriched_description as enriched_description,
-                       e.wikipedia_url as wikipedia_url,
-                       e.location.latitude as latitude,
-                       e.location.longitude as longitude,
-                       conversations
-            """
-        else:
-            # Return all locations (no session filtering)
-            query = """
-                MATCH (e:Entity {type: 'LOCATION'})
-                WHERE $has_coordinates = false OR (e.location.latitude IS NOT NULL AND e.location.longitude IS NOT NULL)
-                WITH e LIMIT $limit
-                OPTIONAL MATCH (e)-[:EXTRACTED_FROM]->(m:Message)<-[:HAS_MESSAGE]-(c:Conversation)
-                WITH e, collect(DISTINCT {id: c.id, title: c.title, session_id: c.session_id}) as conversations
-                RETURN e.id as id,
-                       e.name as name,
-                       e.subtype as subtype,
-                       e.description as description,
-                       e.enriched_description as enriched_description,
-                       e.wikipedia_url as wikipedia_url,
-                       e.location.latitude as latitude,
-                       e.location.longitude as longitude,
-                       conversations
-            """
-
-        params = {
-            "session_id": session_id,
-            "has_coordinates": has_coordinates,
-            "limit": limit,
-        }
-
-        try:
-            results = await self._client.execute_read(query, params)
-            locations = []
-            for row in results:
-                # Filter out null conversation entries
-                convs = [c for c in (row.get("conversations") or []) if c.get("id")]
-                locations.append(
-                    {
-                        "id": row["id"],
-                        "name": row["name"],
-                        "subtype": row.get("subtype"),
-                        "description": row.get("description"),
-                        "enriched_description": row.get("enriched_description"),
-                        "wikipedia_url": row.get("wikipedia_url"),
-                        "latitude": row.get("latitude"),
-                        "longitude": row.get("longitude"),
-                        "conversations": convs,
-                    }
-                )
-            return locations
-        except Exception:
-            return []
+        return await self._bundle.utility.get_locations(
+            session_id=session_id,
+            has_coordinates=has_coordinates,
+            limit=limit,
+        )
 
     def _create_embedder(self):
         """Create embedder based on settings."""
@@ -1057,13 +883,16 @@ class MemoryClient:
         if not self._settings.enrichment.background_enabled:
             return None
 
-        if self._client is None:
+        # Enrichment service currently requires a raw Neo4j client.
+        # This will be migrated to use GraphBackend in Stage 2.
+        raw_client = self._bundle.raw if self._bundle is not None else self._client
+        if raw_client is None:
             return None
 
         from neo4j_agent_memory.enrichment.background import BackgroundEnrichmentService
 
         service = BackgroundEnrichmentService(
-            client=self._client,
+            client=raw_client,
             provider=self._enrichment_provider,
             max_queue_size=self._settings.enrichment.queue_max_size,
             max_retries=self._settings.enrichment.max_retries,

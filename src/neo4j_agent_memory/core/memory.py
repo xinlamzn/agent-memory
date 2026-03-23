@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 if TYPE_CHECKING:
     from neo4j_agent_memory.embeddings.base import Embedder
     from neo4j_agent_memory.extraction.base import EntityExtractor
+    from neo4j_agent_memory.graph.backend_protocol import GraphBackend
     from neo4j_agent_memory.graph.client import Neo4jClient
 
 
@@ -75,7 +76,7 @@ class BaseMemory(ABC, Generic[T]):
 
     def __init__(
         self,
-        client: "Neo4jClient",
+        client: "GraphBackend | Neo4jClient",
         embedder: "Embedder | None" = None,
         extractor: "EntityExtractor | None" = None,
     ):
@@ -83,7 +84,9 @@ class BaseMemory(ABC, Generic[T]):
         Initialize the memory.
 
         Args:
-            client: Neo4j client for database operations
+            client: Backend for database operations.  Accepts either a
+                ``GraphBackend`` (preferred, backend-neutral) or a legacy
+                ``Neo4jClient`` for backward compatibility.
             embedder: Optional embedder for generating embeddings
             extractor: Optional entity extractor for content analysis
         """
@@ -92,8 +95,8 @@ class BaseMemory(ABC, Generic[T]):
         self._extractor = extractor
 
     @property
-    def client(self) -> "Neo4jClient":
-        """Get the Neo4j client."""
+    def client(self) -> "GraphBackend | Neo4jClient":
+        """Get the graph backend / client."""
         return self._client
 
     @property
