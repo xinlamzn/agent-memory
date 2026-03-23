@@ -313,24 +313,91 @@ Return a JSON array of ONLY the entity names that are real named entities. Examp
 Return just the JSON array, nothing else."""
 
 
+VALIDATE_PROMPT = """You are validating relationship extraction results. Given a text excerpt and a list of candidate relationships extracted by an NER/RE model, determine which relationships are actually stated or clearly implied in the text.
+
+A relationship is VALID if the text explicitly states or strongly implies the connection. A relationship is INVALID if the model is just guessing because two entities co-occur in the same passage.
+
+For each candidate, return its index (0-based) ONLY if the relationship is valid.
+
+Text:
+{text}
+
+Candidate relationships:
+{relations}
+
+Return a JSON array of the indices of VALID relationships. Example: [0, 2, 5]
+If none are valid, return: []
+Return just the JSON array, nothing else."""
+
+
 class BedrockEntityFilter:
-    """Filter entities using Bedrock Claude to identify real named entities."""
+    """Filter entities and validate relations using Bedrock Claude."""
 
     def __init__(self, model_id: str, region: str):
         import boto3
         self._client = boto3.client("bedrock-runtime", region_name=region)
         self._model_id = model_id
 
+    def _call_llm(self, prompt: str) -> str:
+        """Make a single LLM call and return the text response."""
+        response = self._client.invoke_model(
+            modelId=self._model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+            }),
+        )
+        result = json.loads(response["body"].read())
+        content = result["content"][0]["text"].strip()
+        # Strip markdown code blocks if present
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        return content
+
+    @staticmethod
+    def _parse_json_array(text: str) -> list:
+        """Parse a JSON array from LLM output, handling extra text."""
+        # Try direct parse first
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        # Find the first JSON array in the response
+        start = text.find("[")
+        if start == -1:
+            # No array found — LLM might have said "none are valid" in prose
+            # Check for keywords suggesting empty result
+            lower = text.lower()
+            if any(w in lower for w in ("none", "no valid", "empty", "cannot")):
+                return []
+            raise ValueError(f"No JSON array found in: {text[:100]}")
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "[":
+                depth += 1
+            elif text[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except json.JSONDecodeError:
+                        # Array found but content invalid — treat as empty
+                        logger.debug(f"Invalid JSON array content: {text[start:i+1][:80]}")
+                        return []
+        raise ValueError(f"Unbalanced JSON array in: {text[:100]}")
+
     def filter_entities(self, text: str, entity_names: list[str]) -> set[str]:
         """Return set of entity names that are real named entities."""
         if not entity_names:
             return set()
 
-        # Deduplicate for the prompt
         unique_names = sorted(set(entity_names))
         entities_str = "\n".join(f"- {name}" for name in unique_names)
 
-        # Truncate text if too long
         max_text = 2000
         if len(text) > max_text:
             text = text[:max_text] + "..."
@@ -338,32 +405,107 @@ class BedrockEntityFilter:
         prompt = FILTER_PROMPT.format(text=text, entities=entities_str)
 
         try:
-            response = self._client.invoke_model(
-                modelId=self._model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps({
-                    "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": 1024,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                }),
-            )
-            result = json.loads(response["body"].read())
-            content = result["content"][0]["text"].strip()
-
-            # Parse JSON array from response
-            # Handle potential markdown code blocks
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-            kept_names = set(json.loads(content))
-            return kept_names
-
+            return set(self._parse_json_array(self._call_llm(prompt)))
         except Exception as e:
-            logger.warning(f"LLM filter failed: {e}")
-            # Fallback: keep all entities (skip filtering for this message)
+            logger.warning(f"LLM entity filter failed: {e}")
             return set(entity_names)
+
+    def validate_relations(
+        self,
+        text: str,
+        relations: list[tuple[str, str, str, float]],
+    ) -> list[int]:
+        """Validate candidate relations against source text.
+
+        Args:
+            text: The source message text.
+            relations: List of (source_name, target_name, relation_type, confidence).
+
+        Returns:
+            List of indices into `relations` that are valid.
+        """
+        if not relations:
+            return []
+
+        max_text = 2000
+        if len(text) > max_text:
+            text = text[:max_text] + "..."
+
+        relations_str = "\n".join(
+            f"{i}. {src} --[{rel}]--> {tgt}  (confidence: {conf:.2f})"
+            for i, (src, tgt, rel, conf) in enumerate(relations)
+        )
+        prompt = VALIDATE_PROMPT.format(text=text, relations=relations_str)
+
+        try:
+            indices = self._parse_json_array(self._call_llm(prompt))
+            return [i for i in indices if isinstance(i, int) and 0 <= i < len(relations)]
+        except Exception as e:
+            logger.warning(f"LLM relation validation failed: {e}")
+            # Fallback: keep all relations
+            return list(range(len(relations)))
+
+
+# ---------------------------------------------------------------------------
+# Direction normalization
+# ---------------------------------------------------------------------------
+
+# Rules: relation_type -> (valid_source_types, valid_target_types)
+# When the relation is in the wrong direction, flip source and target.
+# "ANY" means no constraint on that side.
+DIRECTION_RULES: dict[str, tuple[set[str], set[str]]] = {
+    "CEO_OF":          ({"PERSON"}, {"ORGANIZATION", "OBJECT"}),
+    "FOUNDED_BY":      ({"ORGANIZATION", "OBJECT"}, {"PERSON"}),
+    "WORKS_AT":        ({"PERSON"}, {"ORGANIZATION", "OBJECT", "LOCATION"}),
+    "MEMBER_OF":       ({"PERSON"}, {"ORGANIZATION", "OBJECT"}),
+    "OWNS":            ({"ORGANIZATION", "PERSON"}, {"OBJECT", "ORGANIZATION", "LOCATION"}),
+    "LIVES_IN":        ({"PERSON"}, {"LOCATION"}),
+    "LOCATED_IN":      ({"ORGANIZATION", "OBJECT"}, {"LOCATION"}),
+    "SUBSIDIARY_OF":   ({"ORGANIZATION"}, {"ORGANIZATION"}),
+    "MANUFACTURED_BY": ({"OBJECT"}, {"ORGANIZATION"}),
+    "ORGANIZED_BY":    ({"OBJECT", "EVENT"}, {"ORGANIZATION", "PERSON"}),
+}
+
+
+def _type_score(src_type: str, tgt_type: str, rule: tuple[set[str], set[str]]) -> int:
+    """Score how well (src_type, tgt_type) matches a direction rule. Higher = better."""
+    valid_src, valid_tgt = rule
+    score = 0
+    if src_type in valid_src:
+        score += 2
+    if tgt_type in valid_tgt:
+        score += 2
+    return score
+
+
+def normalize_relation(
+    source_name: str,
+    source_type: str,
+    target_name: str,
+    target_type: str,
+    relation_type: str,
+    confidence: float,
+) -> tuple[str, str, str, str, str, float] | None:
+    """Normalize the direction of a relation based on entity type rules.
+
+    Returns (source_name, source_type, target_name, target_type, relation_type, confidence)
+    or None if the relation should be discarded.
+    """
+    rule = DIRECTION_RULES.get(relation_type)
+    if rule is None:
+        # No rule for this relation type (USED_BY, PART_OF, CHILD_OF, KNOWS, etc.)
+        # Keep as-is
+        return (source_name, source_type, target_name, target_type, relation_type, confidence)
+
+    fwd_score = _type_score(source_type, target_type, rule)
+    rev_score = _type_score(target_type, source_type, rule)
+
+    if fwd_score >= rev_score:
+        # Current direction is correct (or tied — keep as-is)
+        return (source_name, source_type, target_name, target_type, relation_type, confidence)
+    else:
+        # Reversed — flip source and target
+        return (target_name, target_type, source_name, source_type, relation_type, confidence)
 
 
 # ---------------------------------------------------------------------------
@@ -375,8 +517,14 @@ async def process_message(
     extractor: GLiRELExtractor,
     message: dict,
     entity_filter: BedrockEntityFilter | None = None,
+    seen_relations: set[tuple[str, str, str]] | None = None,
 ) -> dict:
-    """Process a single message to extract and store relationships."""
+    """Process a single message to extract and store relationships.
+
+    Args:
+        seen_relations: Global set of (source_id, target_id, relation_type) tuples
+            already stored, used for cross-message deduplication.
+    """
     content = message["content"]
     entities_data = message["entities"]
 
@@ -388,7 +536,8 @@ async def process_message(
 
     # Convert to ExtractedEntity objects for GLiREL
     entities = []
-    entity_id_map = {}
+    entity_id_map = {}   # name.lower() -> node id
+    entity_type_map = {} # name.lower() -> entity type
 
     for e in entities_data:
         entity = ExtractedEntity(
@@ -399,6 +548,7 @@ async def process_message(
         )
         entities.append(entity)
         entity_id_map[e["name"].lower()] = e["id"]
+        entity_type_map[e["name"].lower()] = e["type"]
 
     if len(entities) < 2:
         return {"relations_extracted": 0, "relations_stored": 0,
@@ -417,35 +567,89 @@ async def process_message(
                 "entities_before": len(message["entities"]),
                 "entities_after": len(entities)}
 
+    # Normalize direction and deduplicate within this message
+    normalized = []
+    local_seen: set[tuple[str, str, str]] = set()
+
+    for rel in relations:
+        src_name = rel.source.lower().strip()
+        tgt_name = rel.target.lower().strip()
+        src_type = entity_type_map.get(src_name, "OBJECT")
+        tgt_type = entity_type_map.get(tgt_name, "OBJECT")
+
+        result = normalize_relation(
+            src_name, src_type, tgt_name, tgt_type,
+            rel.relation_type, rel.confidence,
+        )
+        if result is None:
+            continue
+
+        norm_src, _, norm_tgt, _, norm_rel, norm_conf = result
+
+        # Local dedup (within this message)
+        key = (norm_src, norm_tgt, norm_rel)
+        if key in local_seen:
+            continue
+        local_seen.add(key)
+
+        # Discard the reverse if we already have the forward direction locally
+        rev_key = (norm_tgt, norm_src, norm_rel)
+        if rev_key in local_seen:
+            continue
+
+        normalized.append((norm_src, norm_tgt, norm_rel, norm_conf))
+
+    # LLM-based relation validation — ask LLM which relations are actually
+    # stated in the text (filters out spurious pairwise associations).
+    # Skip for single relations (no pairwise explosion risk).
+    pre_validation_count = len(normalized)
+    if entity_filter and len(normalized) >= 2:
+        valid_indices = entity_filter.validate_relations(content, normalized)
+        normalized = [normalized[i] for i in valid_indices]
+
     # Store relations using the graph client API
     client = memory.short_term._client
     stored = 0
     from datetime import datetime
 
-    for rel in relations:
-        source_name = rel.source.lower().strip()
-        target_name = rel.target.lower().strip()
-        source_id = entity_id_map.get(source_name)
-        target_id = entity_id_map.get(target_name)
+    for norm_src, norm_tgt, norm_rel, norm_conf in normalized:
+        source_id = entity_id_map.get(norm_src)
+        target_id = entity_id_map.get(norm_tgt)
 
-        if source_id and target_id:
-            try:
-                await client.link_nodes(
-                    "Entity", source_id,
-                    "Entity", target_id,
-                    "RELATED_TO",
-                    properties={
-                        "relation_type": rel.relation_type,
-                        "confidence": rel.confidence,
-                        "created_at": datetime.utcnow().isoformat(),
-                    },
-                )
-                stored += 1
-            except Exception as e:
-                logger.debug(f"Failed to create relation: {e}")
+        if not source_id or not target_id:
+            continue
+
+        # Cross-message dedup: skip if already stored in a previous message
+        global_key = (source_id, target_id, norm_rel)
+        if seen_relations is not None:
+            if global_key in seen_relations:
+                continue
+            # Also check reverse — if we already stored A->B, skip B->A
+            rev_global_key = (target_id, source_id, norm_rel)
+            if rev_global_key in seen_relations:
+                continue
+
+        try:
+            await client.link_nodes(
+                "Entity", source_id,
+                "Entity", target_id,
+                "RELATED_TO",
+                properties={
+                    "relation_type": norm_rel,
+                    "confidence": norm_conf,
+                    "created_at": datetime.utcnow().isoformat(),
+                },
+            )
+            stored += 1
+            if seen_relations is not None:
+                seen_relations.add(global_key)
+        except Exception as e:
+            logger.debug(f"Failed to create relation: {e}")
 
     return {
         "relations_extracted": len(relations),
+        "relations_validated": len(normalized),
+        "relations_pre_validation": pre_validation_count,
         "relations_stored": stored,
         "entities_before": len(message["entities"]),
         "entities_after": len(entities),
@@ -505,15 +709,26 @@ async def backfill_relationships(
     total_stored = 0
     total_entities_before = 0
     total_entities_after = 0
+    total_pre_validation = 0
+    total_validated = 0
     errors = 0
 
+    # Cross-message dedup set: (source_id, target_id, relation_type)
+    seen_relations: set[tuple[str, str, str]] = set()
+
     for msg in messages:
-        result = await process_message(memory, extractor, msg, entity_filter=entity_filter)
+        result = await process_message(
+            memory, extractor, msg,
+            entity_filter=entity_filter,
+            seen_relations=seen_relations,
+        )
 
         total_extracted += result.get("relations_extracted", 0)
         total_stored += result.get("relations_stored", 0)
         total_entities_before += result.get("entities_before", 0)
         total_entities_after += result.get("entities_after", 0)
+        total_pre_validation += result.get("relations_pre_validation", 0)
+        total_validated += result.get("relations_validated", 0)
         if result.get("error"):
             errors += 1
 
@@ -548,7 +763,12 @@ async def backfill_relationships(
         print(f"  {color('Entities after filter:', Colors.DIM)} {total_entities_after:,}")
         pct = (1 - total_entities_after / total_entities_before) * 100 if total_entities_before else 0
         print(f"  {color('Filtered out:', Colors.DIM)} {pct:.0f}%")
-    print(f"  {color('Relations extracted:', Colors.DIM)} {total_extracted:,}")
+    print(f"  {color('Relations extracted (GLiREL):', Colors.DIM)} {total_extracted:,}")
+    if entity_filter and total_pre_validation > 0:
+        print(f"  {color('Relations after normalization:', Colors.DIM)} {total_pre_validation:,}")
+        print(f"  {color('Relations after LLM validation:', Colors.DIM)} {total_validated:,}")
+        val_pct = (1 - total_validated / total_pre_validation) * 100 if total_pre_validation else 0
+        print(f"  {color('Validation filtered out:', Colors.DIM)} {val_pct:.0f}%")
     print(f"  {color('Relations stored:', Colors.DIM)} {total_stored:,}")
     print(f"  {color('Errors:', Colors.DIM)} {errors}")
     print(f"  {color('Elapsed time:', Colors.DIM)} {format_duration(elapsed)}")
