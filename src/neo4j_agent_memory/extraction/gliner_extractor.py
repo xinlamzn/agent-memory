@@ -973,24 +973,52 @@ class GLiRELExtractor:
     def _entities_to_glirel_format(
         self,
         entities: list[ExtractedEntity],
+        tokens: list[str] | None = None,
     ) -> list[list[int | str]]:
         """Convert ExtractedEntity list to GLiREL NER format.
 
         GLiREL expects entities as: [[start_token, end_token, type, text], ...]
-        But it also accepts character positions when using predict_relations with text.
+        where start_token and end_token are token indices (not character positions).
+
+        Args:
+            entities: List of extracted entities
+            tokens: Pre-tokenized text (token list). When provided, entity names
+                    are located by matching against tokens to get correct indices.
         """
         glirel_entities = []
+        # Build a lowercase token list for matching
+        tokens_lower = [t.lower() for t in tokens] if tokens else None
+
         for entity in entities:
-            # GLiREL format: [start, end, type, text]
-            # Using character positions
-            glirel_entities.append(
-                [
-                    entity.start_pos or 0,
-                    entity.end_pos or len(entity.name),
-                    entity.type,
-                    entity.name,
-                ]
-            )
+            if tokens_lower is not None:
+                # Find token span by matching entity name tokens against text tokens
+                name_tokens = entity.name.lower().split()
+                start_idx = None
+                for i in range(len(tokens_lower) - len(name_tokens) + 1):
+                    if tokens_lower[i : i + len(name_tokens)] == name_tokens:
+                        start_idx = i
+                        break
+                if start_idx is None:
+                    # Fallback: try partial match (first token)
+                    for i, t in enumerate(tokens_lower):
+                        if t == name_tokens[0]:
+                            start_idx = i
+                            break
+                if start_idx is not None:
+                    end_idx = start_idx + len(name_tokens)
+                    glirel_entities.append(
+                        [start_idx, end_idx, entity.type, entity.name]
+                    )
+            else:
+                # Fallback to character positions
+                glirel_entities.append(
+                    [
+                        entity.start_pos or 0,
+                        entity.end_pos or len(entity.name),
+                        entity.type,
+                        entity.name,
+                    ]
+                )
         return glirel_entities
 
     def _extract_relations_sync(
@@ -1015,8 +1043,35 @@ class GLiRELExtractor:
         # Tokenize text
         tokens = self._tokenize(text)
 
-        # Convert entities to GLiREL format
-        ner_entities = self._entities_to_glirel_format(entities)
+        # Convert entities to GLiREL format (with token positions)
+        ner_entities = self._entities_to_glirel_format(entities, tokens=tokens)
+
+        if len(ner_entities) < 2:
+            return []
+
+        # Build a lookup from token position to original entity name
+        # GLiREL may adjust spans, so we match by overlap with our NER entities
+        pos_to_entity: dict[tuple[int, int], str] = {}
+        for ner_ent in ner_entities:
+            pos_to_entity[(ner_ent[0], ner_ent[1])] = ner_ent[3]  # name
+
+        def _resolve_entity_name(pos: list[int]) -> str | None:
+            """Map a GLiREL head/tail position back to our NER entity name."""
+            pred_start, pred_end = pos[0], pos[1]
+            # Exact match first
+            if (pred_start, pred_end) in pos_to_entity:
+                return pos_to_entity[(pred_start, pred_end)]
+            # Overlap match: find NER entity whose span overlaps most
+            best_name = None
+            best_overlap = 0
+            for (ner_start, ner_end), name in pos_to_entity.items():
+                overlap_start = max(pred_start, ner_start)
+                overlap_end = min(pred_end, ner_end)
+                overlap = max(0, overlap_end - overlap_start)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_name = name
+            return best_name
 
         # Run GLiREL prediction
         predictions = self.model.predict_relations(
@@ -1027,16 +1082,29 @@ class GLiRELExtractor:
         )
 
         relations = []
+        seen = set()  # deduplicate (source, target, label) triples
         for pred in predictions:
-            head_text = pred.get("head_text", "")
-            tail_text = pred.get("tail_text", "")
+            head_pos = pred.get("head_pos", [])
+            tail_pos = pred.get("tail_pos", [])
             label = pred.get("label", "RELATED_TO")
             score = pred.get("score", 0.0)
 
-            # Create relation
+            # Resolve back to original entity names
+            head_name = _resolve_entity_name(head_pos) if head_pos else None
+            tail_name = _resolve_entity_name(tail_pos) if tail_pos else None
+
+            if not head_name or not tail_name or head_name == tail_name:
+                continue
+
+            # Deduplicate
+            key = (head_name, tail_name, label)
+            if key in seen:
+                continue
+            seen.add(key)
+
             relation = ExtractedRelation(
-                source=head_text,
-                target=tail_text,
+                source=head_name,
+                target=tail_name,
                 relation_type=label.upper().replace(" ", "_"),
                 confidence=score,
             )

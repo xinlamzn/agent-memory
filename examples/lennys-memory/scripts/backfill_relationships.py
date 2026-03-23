@@ -17,11 +17,15 @@ Features:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
+import ssl
 import sys
 import time
+import urllib.request
 import warnings
+from collections import defaultdict
 from pathlib import Path
 
 # Suppress warnings before imports
@@ -46,10 +50,6 @@ from neo4j_agent_memory.extraction.gliner_extractor import (
     is_glirel_available,
 )
 from neo4j_agent_memory.extraction.base import ExtractedEntity
-from neo4j_agent_memory.graph.queries import (
-    CREATE_ENTITY_RELATION_BY_ID,
-    CREATE_ENTITY_RELATION_BY_NAME,
-)
 
 # Load .env file from backend directory
 load_dotenv(Path(__file__).parent.parent / "backend" / ".env")
@@ -100,193 +100,291 @@ def format_duration(seconds: float) -> str:
         return f"{hours}h {mins}m"
 
 
-# Cypher queries for backfill
-GET_MESSAGES_WITH_ENTITIES = """
-MATCH (m:Message)-[:MENTIONS]->(e:Entity)
-WITH m, collect(DISTINCT {
-    id: e.id,
-    name: e.name,
-    type: e.type,
-    subtype: e.subtype
-}) AS entities
-WHERE size(entities) >= 2
-RETURN m.id AS message_id,
-       m.content AS content,
-       entities
-ORDER BY m.created_at
-SKIP $skip
-LIMIT $limit
-"""
+# ---------------------------------------------------------------------------
+# OpenSearch helpers (for bulk data loading without Cypher)
+# ---------------------------------------------------------------------------
 
-GET_MESSAGES_WITHOUT_RELATIONSHIPS = """
-// Find messages that have entities but where those entities don't have RELATED_TO between them
-MATCH (m:Message)-[:MENTIONS]->(e:Entity)
-WITH m, collect(DISTINCT e) AS entities
-WHERE size(entities) >= 2
-// Check if any pair of entities from this message has a RELATED_TO relationship
-WITH m, entities,
-     [e IN entities | e.id] AS entity_ids
-OPTIONAL MATCH (e1:Entity)-[r:RELATED_TO]-(e2:Entity)
-WHERE e1.id IN entity_ids AND e2.id IN entity_ids
-WITH m, entities, count(r) AS rel_count
-WHERE rel_count = 0
-RETURN m.id AS message_id,
-       m.content AS content,
-       [e IN entities | {
-           id: e.id,
-           name: e.name,
-           type: e.type,
-           subtype: e.subtype
-       }] AS entities
-ORDER BY m.created_at
-SKIP $skip
-LIMIT $limit
-"""
-
-COUNT_MESSAGES_WITH_ENTITIES = """
-MATCH (m:Message)-[:MENTIONS]->(e:Entity)
-WITH m, count(DISTINCT e) AS entity_count
-WHERE entity_count >= 2
-RETURN count(m) AS total
-"""
-
-COUNT_MESSAGES_WITHOUT_RELATIONSHIPS = """
-MATCH (m:Message)-[:MENTIONS]->(e:Entity)
-WITH m, collect(DISTINCT e) AS entities
-WHERE size(entities) >= 2
-WITH m, entities,
-     [e IN entities | e.id] AS entity_ids
-OPTIONAL MATCH (e1:Entity)-[r:RELATED_TO]-(e2:Entity)
-WHERE e1.id IN entity_ids AND e2.id IN entity_ids
-WITH m, count(r) AS rel_count
-WHERE rel_count = 0
-RETURN count(m) AS total
-"""
-
-GET_RELATIONSHIP_STATS = """
-MATCH ()-[r:RELATED_TO]->()
-RETURN count(r) AS total_relationships,
-       count(DISTINCT r.relation_type) AS unique_types
-"""
+def _os_request(endpoint: str, path: str, body: dict | None = None,
+                method: str = "POST", username: str | None = None,
+                password: str | None = None, verify_ssl: bool = True) -> dict:
+    url = f"{endpoint.rstrip('/')}/{path.lstrip('/')}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    if username and password:
+        import base64
+        creds = base64.b64encode(f"{username}:{password}".encode()).decode()
+        req.add_header("Authorization", f"Basic {creds}")
+    ctx = None
+    if not verify_ssl:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    resp = urllib.request.urlopen(req, context=ctx)
+    return json.loads(resp.read().decode())
 
 
-async def get_message_count(
-    memory: MemoryClient,
-    skip_processed: bool = True,
-) -> int:
-    """Get count of messages that need relationship extraction."""
-    query = (
-        COUNT_MESSAGES_WITHOUT_RELATIONSHIPS
-        if skip_processed
-        else COUNT_MESSAGES_WITH_ENTITIES
+def _scroll_all(endpoint: str, index: str, query: dict,
+                fields: list[str] | None = None,
+                username: str | None = None, password: str | None = None,
+                verify_ssl: bool = True, batch_size: int = 5000) -> list[dict]:
+    body: dict = {"query": query, "size": batch_size}
+    if fields:
+        body["_source"] = fields
+    result = _os_request(endpoint, f"{index}/_search?scroll=2m",
+                         body=body, username=username, password=password,
+                         verify_ssl=verify_ssl)
+    scroll_id = result.get("_scroll_id")
+    hits = result["hits"]["hits"]
+    all_docs = list(hits)
+    while hits:
+        result = _os_request(endpoint, "_search/scroll",
+                             body={"scroll": "2m", "scroll_id": scroll_id},
+                             username=username, password=password,
+                             verify_ssl=verify_ssl)
+        scroll_id = result.get("_scroll_id")
+        hits = result["hits"]["hits"]
+        all_docs.extend(hits)
+    if scroll_id:
+        try:
+            _os_request(endpoint, "_search/scroll",
+                        body={"scroll_id": scroll_id}, method="DELETE",
+                        username=username, password=password,
+                        verify_ssl=verify_ssl)
+        except Exception:
+            pass
+    return all_docs
+
+
+def load_messages_with_entities(endpoint: str, username: str | None = None,
+                                password: str | None = None,
+                                verify_ssl: bool = True) -> list[dict]:
+    """Load all messages that have 2+ entities, along with entity details.
+
+    Returns list of dicts: {message_id, content, entities: [{id, name, type, subtype}]}
+    """
+    # 1. Get all MENTIONS edges → group by message
+    print("  Loading MENTIONS edges...", end=" ", flush=True)
+    mentions_docs = _scroll_all(
+        endpoint, "memory-lpg-edges",
+        {"term": {"type": "MENTIONS"}},
+        fields=["source", "target"],
+        username=username, password=password, verify_ssl=verify_ssl,
     )
-    results = await memory._client.execute_read(query)
-    return results[0]["total"] if results else 0
+    msg_to_entity_ids: dict[str, set[str]] = defaultdict(set)
+    for doc in mentions_docs:
+        src = doc["_source"]
+        msg_to_entity_ids[src["source"]].add(src["target"])
+    print(f"{len(mentions_docs)} edges, {len(msg_to_entity_ids)} messages")
 
+    # Filter to messages with 2+ entities
+    multi_entity_msgs = {
+        mid: eids for mid, eids in msg_to_entity_ids.items()
+        if len(eids) >= 2
+    }
+    print(f"  Messages with 2+ entities: {len(multi_entity_msgs)}")
 
-async def get_messages_batch(
-    memory: MemoryClient,
-    skip: int,
-    limit: int,
-    skip_processed: bool = True,
-) -> list[dict]:
-    """Get a batch of messages with their entities."""
-    query = (
-        GET_MESSAGES_WITHOUT_RELATIONSHIPS
-        if skip_processed
-        else GET_MESSAGES_WITH_ENTITIES
+    if not multi_entity_msgs:
+        return []
+
+    # 2. Collect all needed entity IDs and message IDs
+    all_entity_ids = set()
+    for eids in multi_entity_msgs.values():
+        all_entity_ids.update(eids)
+
+    # 3. Load entity details
+    print("  Loading entity details...", end=" ", flush=True)
+    entity_docs = _scroll_all(
+        endpoint, "memory-lpg-nodes",
+        {"term": {"labels": "Entity"}},
+        fields=["id", "properties.name", "properties.type", "properties.subtype", "properties.id"],
+        username=username, password=password, verify_ssl=verify_ssl,
     )
-    results = await memory._client.execute_read(query, {"skip": skip, "limit": limit})
+    entity_map = {}  # node_id → {id, name, type, subtype}
+    for doc in entity_docs:
+        src = doc["_source"]
+        props = src["properties"]
+        entity_map[src["id"]] = {
+            "id": props.get("id", src["id"]),
+            "name": props.get("name"),
+            "type": props.get("type"),
+            "subtype": props.get("subtype"),
+        }
+    print(f"{len(entity_map)} entities")
+
+    # 4. Load message content for relevant messages
+    print("  Loading message content...", end=" ", flush=True)
+    msg_docs = _scroll_all(
+        endpoint, "memory-lpg-nodes",
+        {"term": {"labels": "Message"}},
+        fields=["id", "properties.content", "properties.id"],
+        username=username, password=password, verify_ssl=verify_ssl,
+    )
+    msg_content = {}  # node_id → {id, content}
+    for doc in msg_docs:
+        src = doc["_source"]
+        node_id = src["id"]
+        if node_id in multi_entity_msgs:
+            msg_content[node_id] = {
+                "id": src["properties"].get("id", node_id),
+                "content": src["properties"].get("content", ""),
+            }
+    print(f"{len(msg_content)} messages loaded")
+
+    # 5. Assemble results
+    results = []
+    for msg_node_id, entity_node_ids in multi_entity_msgs.items():
+        msg = msg_content.get(msg_node_id)
+        if not msg or not msg["content"]:
+            continue
+        entities = []
+        for eid in entity_node_ids:
+            e = entity_map.get(eid)
+            if e and e["name"]:
+                entities.append(e)
+        if len(entities) >= 2:
+            results.append({
+                "message_id": msg["id"],
+                "content": msg["content"],
+                "entities": entities,
+            })
+
     return results
 
 
-async def get_relationship_stats(memory: MemoryClient) -> dict:
-    """Get current relationship statistics."""
-    results = await memory._client.execute_read(GET_RELATIONSHIP_STATS)
-    if results:
-        return {
-            "total_relationships": results[0]["total_relationships"],
-            "unique_types": results[0]["unique_types"],
-        }
-    return {"total_relationships": 0, "unique_types": 0}
+def get_existing_related_to(endpoint: str, username: str | None = None,
+                            password: str | None = None,
+                            verify_ssl: bool = True) -> set[tuple[str, str]]:
+    """Get set of (source_id, target_id) for existing RELATED_TO edges."""
+    docs = _scroll_all(
+        endpoint, "memory-lpg-edges",
+        {"term": {"type": "RELATED_TO"}},
+        fields=["source", "target"],
+        username=username, password=password, verify_ssl=verify_ssl,
+    )
+    pairs = set()
+    for doc in docs:
+        src = doc["_source"]
+        pairs.add((src["source"], src["target"]))
+        pairs.add((src["target"], src["source"]))  # bidirectional check
+    return pairs
 
 
-async def store_relations(
-    memory: MemoryClient,
-    relations: list[dict],
-    entity_id_map: dict[str, str],
-) -> int:
-    """Store extracted relations as RELATED_TO relationships.
+def count_related_to(endpoint: str, username: str | None = None,
+                     password: str | None = None,
+                     verify_ssl: bool = True) -> int:
+    """Count RELATED_TO edges."""
+    result = _os_request(
+        endpoint, "memory-lpg-edges/_count",
+        body={"query": {"term": {"type": "RELATED_TO"}}},
+        username=username, password=password, verify_ssl=verify_ssl,
+    )
+    return result.get("count", 0)
 
-    Args:
-        memory: MemoryClient instance
-        relations: List of relation dicts with source, target, relation_type, confidence
-        entity_id_map: Mapping from entity name (lowercase) to entity ID
 
-    Returns:
-        Number of relationships created
-    """
-    created = 0
+# ---------------------------------------------------------------------------
+# LLM entity filtering via Bedrock
+# ---------------------------------------------------------------------------
 
-    for rel in relations:
-        source_name = rel["source"].lower()
-        target_name = rel["target"].lower()
+FILTER_PROMPT = """You are filtering named entity recognition results. Given a text excerpt and a list of extracted entities, return ONLY the real named entities — specific proper nouns that refer to actual people, companies, products, technologies, or places.
 
-        # Try to find entity IDs
-        source_id = entity_id_map.get(source_name)
-        target_id = entity_id_map.get(target_name)
+REMOVE:
+- Common nouns (product, company, startup, engineer, founder, customer, team, model, agent)
+- Generic terms (AI, LLM, three, five, world, space, market, business)
+- Temporal phrases (the end of the day, these days, daily, hours)
+- Roles/titles used generically (CEO, PM, engineer, founder)
+- Vague references (stuff, things, way)
 
-        if source_id and target_id:
-            # Use ID-based query (faster)
-            try:
-                await memory._client.execute_write(
-                    CREATE_ENTITY_RELATION_BY_ID,
-                    {
-                        "source_id": source_id,
-                        "target_id": target_id,
-                        "relation_type": rel["relation_type"],
-                        "confidence": rel["confidence"],
-                    },
-                )
-                created += 1
-            except Exception as e:
-                logger.debug(f"Failed to create relation by ID: {e}")
-        else:
-            # Fallback to name-based query
-            try:
-                await memory._client.execute_write(
-                    CREATE_ENTITY_RELATION_BY_NAME,
-                    {
-                        "source_name": rel["source"],
-                        "target_name": rel["target"],
-                        "relation_type": rel["relation_type"],
-                        "confidence": rel["confidence"],
-                    },
-                )
-                created += 1
-            except Exception as e:
-                logger.debug(f"Failed to create relation by name: {e}")
+KEEP:
+- Real person names (Lenny Rachitsky, Marc Andreessen)
+- Real company names (Google, Stripe, Anthropic)
+- Real product names (ChatGPT, Cursor, Slack, Duolingo)
+- Real technology names (React, Next.js, PostgreSQL)
+- Real place names (San Francisco, Silicon Valley)
+- Specific named concepts (Series A, Y Combinator)
 
-    return created
+Text:
+{text}
 
+Extracted entities:
+{entities}
+
+Return a JSON array of ONLY the entity names that are real named entities. Example: ["Google", "Marc Andreessen", "ChatGPT"]
+Return just the JSON array, nothing else."""
+
+
+class BedrockEntityFilter:
+    """Filter entities using Bedrock Claude to identify real named entities."""
+
+    def __init__(self, model_id: str, region: str):
+        import boto3
+        self._client = boto3.client("bedrock-runtime", region_name=region)
+        self._model_id = model_id
+
+    def filter_entities(self, text: str, entity_names: list[str]) -> set[str]:
+        """Return set of entity names that are real named entities."""
+        if not entity_names:
+            return set()
+
+        # Deduplicate for the prompt
+        unique_names = sorted(set(entity_names))
+        entities_str = "\n".join(f"- {name}" for name in unique_names)
+
+        # Truncate text if too long
+        max_text = 2000
+        if len(text) > max_text:
+            text = text[:max_text] + "..."
+
+        prompt = FILTER_PROMPT.format(text=text, entities=entities_str)
+
+        try:
+            response = self._client.invoke_model(
+                modelId=self._model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                }),
+            )
+            result = json.loads(response["body"].read())
+            content = result["content"][0]["text"].strip()
+
+            # Parse JSON array from response
+            # Handle potential markdown code blocks
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+            kept_names = set(json.loads(content))
+            return kept_names
+
+        except Exception as e:
+            logger.warning(f"LLM filter failed: {e}")
+            # Fallback: keep all entities (skip filtering for this message)
+            return set(entity_names)
+
+
+# ---------------------------------------------------------------------------
+# Processing logic
+# ---------------------------------------------------------------------------
 
 async def process_message(
     memory: MemoryClient,
     extractor: GLiRELExtractor,
     message: dict,
+    entity_filter: BedrockEntityFilter | None = None,
 ) -> dict:
-    """Process a single message to extract and store relationships.
-
-    Args:
-        memory: MemoryClient instance
-        extractor: GLiREL extractor
-        message: Message dict with content and entities
-
-    Returns:
-        Dict with processing stats
-    """
+    """Process a single message to extract and store relationships."""
     content = message["content"]
     entities_data = message["entities"]
+
+    # LLM-based entity filtering
+    if entity_filter:
+        all_names = [e["name"] for e in entities_data]
+        kept_names = entity_filter.filter_entities(content, all_names)
+        entities_data = [e for e in entities_data if e["name"] in kept_names]
 
     # Convert to ExtractedEntity objects for GLiREL
     entities = []
@@ -297,14 +395,15 @@ async def process_message(
             name=e["name"],
             type=e["type"],
             subtype=e.get("subtype"),
-            confidence=1.0,  # Existing entities have implicit high confidence
+            confidence=1.0,
         )
         entities.append(entity)
-        # Build name-to-ID mapping for relationship storage
         entity_id_map[e["name"].lower()] = e["id"]
 
     if len(entities) < 2:
-        return {"relations_extracted": 0, "relations_stored": 0}
+        return {"relations_extracted": 0, "relations_stored": 0,
+                "entities_before": len(message["entities"]),
+                "entities_after": len(entities)}
 
     # Extract relations using GLiREL
     try:
@@ -314,143 +413,129 @@ async def process_message(
         return {"relations_extracted": 0, "relations_stored": 0, "error": str(e)}
 
     if not relations:
-        return {"relations_extracted": 0, "relations_stored": 0}
+        return {"relations_extracted": 0, "relations_stored": 0,
+                "entities_before": len(message["entities"]),
+                "entities_after": len(entities)}
 
-    # Convert to dict format for storage
-    relations_data = [
-        {
-            "source": r.source,
-            "target": r.target,
-            "relation_type": r.relation_type,
-            "confidence": r.confidence,
-        }
-        for r in relations
-    ]
+    # Store relations using the graph client API
+    client = memory.short_term._client
+    stored = 0
+    from datetime import datetime
 
-    # Store relations
-    stored = await store_relations(memory, relations_data, entity_id_map)
+    for rel in relations:
+        source_name = rel.source.lower().strip()
+        target_name = rel.target.lower().strip()
+        source_id = entity_id_map.get(source_name)
+        target_id = entity_id_map.get(target_name)
+
+        if source_id and target_id:
+            try:
+                await client.link_nodes(
+                    "Entity", source_id,
+                    "Entity", target_id,
+                    "RELATED_TO",
+                    properties={
+                        "relation_type": rel.relation_type,
+                        "confidence": rel.confidence,
+                        "created_at": datetime.utcnow().isoformat(),
+                    },
+                )
+                stored += 1
+            except Exception as e:
+                logger.debug(f"Failed to create relation: {e}")
 
     return {
         "relations_extracted": len(relations),
         "relations_stored": stored,
+        "entities_before": len(message["entities"]),
+        "entities_after": len(entities),
     }
 
 
 async def backfill_relationships(
     memory: MemoryClient,
     extractor: GLiRELExtractor,
-    batch_size: int = 50,
-    skip_processed: bool = True,
+    messages: list[dict],
+    entity_filter: BedrockEntityFilter | None = None,
     dry_run: bool = False,
     limit: int | None = None,
 ) -> dict:
-    """Backfill RELATED_TO relationships for existing entities.
-
-    Args:
-        memory: MemoryClient instance
-        extractor: GLiREL extractor
-        batch_size: Number of messages to process per batch
-        skip_processed: Skip messages that already have relationships
-        dry_run: If True, only show what would be done
-        limit: Optional limit on total messages to process
-
-    Returns:
-        Stats dict with total processed, relations extracted, etc.
-    """
-    # Get initial stats
-    initial_stats = await get_relationship_stats(memory)
-    total_messages = await get_message_count(memory, skip_processed)
-
+    """Backfill RELATED_TO relationships for existing entities."""
+    total_messages = len(messages)
     if limit:
         total_messages = min(total_messages, limit)
+        messages = messages[:total_messages]
 
     print(f"\n{color('Relationship Backfill', Colors.BOLD + Colors.CYAN)}")
-    print(f"{'=' * 50}")
+    print("=" * 50)
     print(f"  Messages to process: {total_messages:,}")
-    print(f"  Existing relationships: {initial_stats['total_relationships']:,}")
-    print(f"  Batch size: {batch_size}")
-    print(f"  Skip processed: {skip_processed}")
+    if entity_filter:
+        print(f"  Entity filtering: {color('LLM (Bedrock)', Colors.GREEN)}")
     if dry_run:
         print(f"  {color('DRY RUN MODE', Colors.YELLOW)}")
     print()
 
     if total_messages == 0:
         print(color("No messages need relationship extraction!", Colors.GREEN))
-        return {
-            "messages_processed": 0,
-            "relations_extracted": 0,
-            "relations_stored": 0,
-        }
+        return {"messages_processed": 0, "relations_extracted": 0, "relations_stored": 0}
 
     if dry_run:
-        # Show sample of messages that would be processed
-        print(f"Sample of messages that would be processed:")
-        sample = await get_messages_batch(memory, 0, 5, skip_processed)
-        for msg in sample:
+        print("Sample of messages that would be processed:")
+        for msg in messages[:5]:
             entity_names = [e["name"] for e in msg["entities"]]
-            print(f"  • {len(msg['entities'])} entities: {', '.join(entity_names[:5])}")
-            if len(entity_names) > 5:
-                print(f"    ... and {len(entity_names) - 5} more")
+            if entity_filter:
+                kept = entity_filter.filter_entities(msg["content"], entity_names)
+                filtered = [n for n in entity_names if n in kept]
+                removed = [n for n in entity_names if n not in kept]
+                print(f"  • {len(entity_names)} → {len(filtered)} entities")
+                print(f"    Kept: {', '.join(filtered[:8])}")
+                if removed:
+                    print(f"    Removed: {', '.join(removed[:8])}")
+            else:
+                print(f"  • {len(msg['entities'])} entities: {', '.join(entity_names[:5])}")
+                if len(entity_names) > 5:
+                    print(f"    ... and {len(entity_names) - 5} more")
         print()
-        return {
-            "messages_processed": 0,
-            "relations_extracted": 0,
-            "relations_stored": 0,
-            "dry_run": True,
-        }
+        return {"messages_processed": 0, "relations_extracted": 0, "relations_stored": 0, "dry_run": True}
 
-    # Process messages in batches
+    # Process messages
     start_time = time.time()
     processed = 0
     total_extracted = 0
     total_stored = 0
+    total_entities_before = 0
+    total_entities_after = 0
     errors = 0
-    skip = 0
 
-    while processed < total_messages:
-        batch = await get_messages_batch(memory, skip, batch_size, skip_processed)
+    for msg in messages:
+        result = await process_message(memory, extractor, msg, entity_filter=entity_filter)
 
-        if not batch:
-            break
+        total_extracted += result.get("relations_extracted", 0)
+        total_stored += result.get("relations_stored", 0)
+        total_entities_before += result.get("entities_before", 0)
+        total_entities_after += result.get("entities_after", 0)
+        if result.get("error"):
+            errors += 1
 
-        for msg in batch:
-            result = await process_message(memory, extractor, msg)
+        processed += 1
 
-            total_extracted += result.get("relations_extracted", 0)
-            total_stored += result.get("relations_stored", 0)
-            if result.get("error"):
-                errors += 1
-
-            processed += 1
-
-            # Progress update
-            if processed % 10 == 0 or processed == total_messages:
-                elapsed = time.time() - start_time
-                rate = processed / elapsed if elapsed > 0 else 0
-                eta = (total_messages - processed) / rate if rate > 0 else 0
-
-                sys.stdout.write(
-                    f"\r  Progress: {processed}/{total_messages} "
-                    f"({processed/total_messages*100:.0f}%) "
-                    f"| Relations: {total_stored:,} stored "
-                    f"| {rate:.1f} msg/s "
-                    f"| ETA: {format_duration(eta)}"
-                )
-                sys.stdout.flush()
-
-            if limit and processed >= limit:
-                break
-
-        # When not skipping processed, we need to move skip forward
-        if not skip_processed:
-            skip += batch_size
-        # When skipping processed, keep skip at 0 since we're filtering out done ones
+        if processed % 10 == 0 or processed == total_messages:
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            eta = (total_messages - processed) / rate if rate > 0 else 0
+            sys.stdout.write(
+                f"\r  Progress: {processed}/{total_messages} "
+                f"({processed/total_messages*100:.0f}%) "
+                f"| Relations: {total_stored:,} stored "
+                f"| {rate:.1f} msg/s "
+                f"| ETA: {format_duration(eta)}"
+                "\033[K"
+            )
+            sys.stdout.flush()
 
     print()  # Newline after progress
 
-    # Final stats
     elapsed = time.time() - start_time
-    final_stats = await get_relationship_stats(memory)
 
     print()
     print(color("═" * 50, Colors.CYAN))
@@ -458,14 +543,17 @@ async def backfill_relationships(
     print(color("═" * 50, Colors.CYAN))
     print()
     print(f"  {color('Messages processed:', Colors.DIM)} {processed:,}")
+    if entity_filter and total_entities_before > 0:
+        print(f"  {color('Entities before filter:', Colors.DIM)} {total_entities_before:,}")
+        print(f"  {color('Entities after filter:', Colors.DIM)} {total_entities_after:,}")
+        pct = (1 - total_entities_after / total_entities_before) * 100 if total_entities_before else 0
+        print(f"  {color('Filtered out:', Colors.DIM)} {pct:.0f}%")
     print(f"  {color('Relations extracted:', Colors.DIM)} {total_extracted:,}")
     print(f"  {color('Relations stored:', Colors.DIM)} {total_stored:,}")
     print(f"  {color('Errors:', Colors.DIM)} {errors}")
     print(f"  {color('Elapsed time:', Colors.DIM)} {format_duration(elapsed)}")
-    print(f"  {color('Throughput:', Colors.DIM)} {processed / elapsed:.1f} msg/s")
-    print()
-    print(f"  {color('Total relationships now:', Colors.DIM)} {final_stats['total_relationships']:,}")
-    print(f"  {color('New relationships:', Colors.DIM)} {final_stats['total_relationships'] - initial_stats['total_relationships']:,}")
+    if elapsed > 0:
+        print(f"  {color('Throughput:', Colors.DIM)} {processed / elapsed:.1f} msg/s")
     print()
 
     return {
@@ -474,36 +562,7 @@ async def backfill_relationships(
         "relations_stored": total_stored,
         "errors": errors,
         "elapsed_seconds": elapsed,
-        "new_relationships": final_stats["total_relationships"] - initial_stats["total_relationships"],
     }
-
-
-async def show_status(memory: MemoryClient) -> None:
-    """Show current relationship extraction status."""
-    # Get counts
-    total_with_entities = await get_message_count(memory, skip_processed=False)
-    pending = await get_message_count(memory, skip_processed=True)
-    processed = total_with_entities - pending
-
-    stats = await get_relationship_stats(memory)
-
-    print()
-    print(color("Relationship Extraction Status", Colors.BOLD + Colors.CYAN))
-    print("=" * 50)
-    print()
-    print(f"  {color('Messages with 2+ entities:', Colors.DIM)} {total_with_entities:,}")
-    print(f"  {color('Messages processed:', Colors.DIM)} {processed:,}")
-    print(f"  {color('Messages pending:', Colors.DIM)} {pending:,}")
-    print()
-    print(f"  {color('Total RELATED_TO relationships:', Colors.DIM)} {stats['total_relationships']:,}")
-    print(f"  {color('Unique relationship types:', Colors.DIM)} {stats['unique_types']}")
-    print()
-
-    if pending > 0:
-        print(f"  Run {color('make backfill-relationships', Colors.YELLOW)} to process pending messages.")
-    else:
-        print(f"  {color('All messages have been processed!', Colors.GREEN)}")
-    print()
 
 
 async def main():
@@ -576,34 +635,65 @@ Examples:
         choices=["cpu", "cuda", "mps"],
         help="Device to run GLiREL on (default: cpu)",
     )
+    parser.add_argument(
+        "--filter-model",
+        default="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        help="Bedrock model ID for LLM entity filtering (default: Sonnet 4.5)",
+    )
+    parser.add_argument(
+        "--no-filter",
+        action="store_true",
+        help="Disable LLM entity filtering (use raw NER entities)",
+    )
 
     args = parser.parse_args()
 
+    endpoint = args.memory_store_endpoint
+    username = os.getenv("MEMORY_STORE_USERNAME")
+    password = os.getenv("MEMORY_STORE_PASSWORD")
+    verify_ssl = os.getenv("MEMORY_STORE_VERIFY_SSL", "true").lower() not in (
+        "false", "0", "no",
+    )
+
+    # Handle --status without needing GLiREL
+    if args.status:
+        rel_count = count_related_to(endpoint, username, password, verify_ssl)
+        messages = load_messages_with_entities(endpoint, username, password, verify_ssl)
+        print()
+        print(color("Relationship Extraction Status", Colors.BOLD + Colors.CYAN))
+        print("=" * 50)
+        print()
+        print(f"  {color('Messages with 2+ entities:', Colors.DIM)} {len(messages):,}")
+        print(f"  {color('Total RELATED_TO relationships:', Colors.DIM)} {rel_count:,}")
+        print()
+        return
+
     # Check GLiREL availability
-    if not args.status and not is_glirel_available():
+    if not is_glirel_available():
         print(color("Error: GLiREL is not installed.", Colors.RED))
         print("Install it with: pip install glirel")
         sys.exit(1)
 
-    # Connect to Memory Store with optional auth from environment
-    from pydantic import SecretStr
+    # Load data from Memory Store
+    print()
+    print(color("Loading data from Memory Store...", Colors.DIM))
+    messages = load_messages_with_entities(endpoint, username, password, verify_ssl)
 
-    memory_store_username = os.getenv("MEMORY_STORE_USERNAME")
-    memory_store_password = os.getenv("MEMORY_STORE_PASSWORD")
-    memory_store_verify_ssl = os.getenv("MEMORY_STORE_VERIFY_SSL", "true").lower() not in (
-        "false",
-        "0",
-        "no",
-    )
+    if not messages:
+        print(color("No messages with 2+ entities found!", Colors.YELLOW))
+        return
+
+    # Connect via MemoryClient (for link_nodes API)
+    from pydantic import SecretStr
 
     settings = MemorySettings(
         backend="memory_store",
         memory_store=MemoryStoreConfig(
-            endpoint=args.memory_store_endpoint,
-            username=memory_store_username,
-            password=SecretStr(memory_store_password) if memory_store_password else None,
-            verify_ssl=memory_store_verify_ssl,
-            user_id=memory_store_username or "default",
+            endpoint=endpoint,
+            username=username,
+            password=SecretStr(password) if password else None,
+            verify_ssl=verify_ssl,
+            user_id=username or "default",
         ),
         embedding=EmbeddingConfig(
             provider=EmbeddingProvider.BEDROCK,
@@ -613,7 +703,6 @@ Examples:
         ),
     )
 
-    print()
     print(color("Connecting to Memory Store...", Colors.DIM), end=" ", flush=True)
 
     try:
@@ -621,9 +710,15 @@ Examples:
         async with memory_client as memory:
             print(color("Connected!", Colors.GREEN))
 
-            if args.status:
-                await show_status(memory)
-                return
+            # Initialize LLM entity filter
+            entity_filter = None
+            if not args.no_filter:
+                print(color("Setting up LLM entity filter...", Colors.DIM), end=" ", flush=True)
+                entity_filter = BedrockEntityFilter(
+                    model_id=args.filter_model,
+                    region=args.aws_region,
+                )
+                print(color(f"Ready ({args.filter_model})", Colors.GREEN))
 
             # Initialize GLiREL extractor
             print(color("Loading GLiREL model...", Colors.DIM), end=" ", flush=True)
@@ -639,8 +734,8 @@ Examples:
             await backfill_relationships(
                 memory,
                 extractor,
-                batch_size=args.batch_size,
-                skip_processed=not args.reprocess,
+                messages,
+                entity_filter=entity_filter,
                 dry_run=args.dry_run,
                 limit=args.limit,
             )
@@ -651,6 +746,8 @@ Examples:
         sys.exit(130)
     except Exception as e:
         print(color(f"Error: {e}", Colors.RED))
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
