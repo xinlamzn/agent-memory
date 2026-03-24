@@ -755,6 +755,7 @@ class LongTermMemory(BaseMemory[Entity]):
             query_embedding,
             limit=limit,
             threshold=threshold,
+            query_text=query,
         )
 
         # Normalize filter types
@@ -815,6 +816,7 @@ class LongTermMemory(BaseMemory[Entity]):
             query_embedding,
             limit=limit,
             threshold=threshold,
+            query_text=query,
         )
 
         preferences = []
@@ -1907,6 +1909,7 @@ class LongTermMemory(BaseMemory[Entity]):
             query_embedding,
             limit=limit,
             threshold=threshold,
+            query_text=query,
         )
 
         facts = []

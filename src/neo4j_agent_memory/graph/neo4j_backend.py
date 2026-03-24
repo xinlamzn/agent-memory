@@ -450,6 +450,7 @@ class Neo4jGraphBackend:
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
+        query_text: str | None = None,
     ) -> list[dict[str, Any]]:
         """Semantic vector similarity search.
 

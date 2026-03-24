@@ -689,6 +689,7 @@ class ShortTermMemory(BaseMemory[Message]):
             query_embedding,
             limit=search_limit,
             threshold=threshold,
+            query_text=query,
         )
 
         messages = []

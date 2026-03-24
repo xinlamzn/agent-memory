@@ -110,16 +110,22 @@ class MemoryStoreGraphBackend:
         )
 
         # Verify connectivity with a lightweight count request.
+        # A "no such index" error is expected on a fresh cluster (indices
+        # are auto-created on first write) and still proves the server is
+        # reachable, so we treat it as a successful connectivity check.
         try:
             await self._post("_count", {
                 "tenant_id": self._config.tenant_id,
                 "user_id": self._config.user_id,
             })
         except Exception as e:
-            await self.close()
-            from neo4j_agent_memory.core.exceptions import ConnectionError as ConnErr
+            if "no such index" in str(e).lower():
+                logger.info("Memory Store reachable (indices will be created on first write)")
+            else:
+                await self.close()
+                from neo4j_agent_memory.core.exceptions import ConnectionError as ConnErr
 
-            raise ConnErr(f"Failed to connect to Memory Store: {e}") from e
+                raise ConnErr(f"Failed to connect to Memory Store: {e}") from e
 
     async def close(self) -> None:
         """Release all backend resources."""
@@ -603,8 +609,15 @@ class MemoryStoreGraphBackend:
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
+        query_text: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Semantic vector similarity search via ``_query`` vector mode."""
+        """Semantic vector similarity search via ``_query``.
+
+        When *query_text* is provided, the Memory Store ``_query`` endpoint
+        runs in **hybrid** mode (vector kNN + BM25 text), which improves
+        recall for queries that benefit from both semantic similarity and
+        lexical keyword matching.
+        """
         body: dict[str, Any] = {
             **self._scope(label),
             "query_vector": query_embedding,
@@ -613,6 +626,8 @@ class MemoryStoreGraphBackend:
         }
         if property_name != "embedding":
             body["vector_field"] = property_name
+        if query_text:
+            body["query_text"] = query_text
 
         result = await self._post("_query", body)
         if not result:

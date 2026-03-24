@@ -117,18 +117,22 @@ def _scroll_all(endpoint: str, index: str, query: dict, fields: list[str] | None
 def export_entities(args):
     """Export entities from the graph to a JSON file."""
     endpoint = args.endpoint
+    database = args.database
     username = os.getenv("MEMORY_STORE_USERNAME")
     password = os.getenv("MEMORY_STORE_PASSWORD")
     verify_ssl = os.getenv("MEMORY_STORE_VERIFY_SSL", "true").lower() not in ("false", "0", "no")
+    nodes_index = f"{database}-lpg-nodes"
+    edges_index = f"{database}-lpg-edges"
 
     print("Exporting entities from Memory Store...")
     print(f"  Endpoint: {endpoint}")
+    print(f"  Database: {database}")
     start_time = time.time()
 
     # Step 1: Fetch all Conversation nodes → {node_id: session_id}
     print("  Fetching conversations...", end=" ", flush=True)
     conv_docs = _scroll_all(
-        endpoint, "memory-lpg-nodes",
+        endpoint, nodes_index,
         {"term": {"labels": "Conversation"}},
         fields=["id", "properties.session_id"],
         username=username, password=password, verify_ssl=verify_ssl,
@@ -142,7 +146,7 @@ def export_entities(args):
     # Step 2: Fetch all HAS_MESSAGE edges → {message_node_id: conv_node_id}
     print("  Fetching HAS_MESSAGE edges...", end=" ", flush=True)
     has_msg_docs = _scroll_all(
-        endpoint, "memory-lpg-edges",
+        endpoint, edges_index,
         {"term": {"type": "HAS_MESSAGE"}},
         fields=["source", "target"],
         username=username, password=password, verify_ssl=verify_ssl,
@@ -157,7 +161,7 @@ def export_entities(args):
     # Step 3: Fetch all Message nodes → {node_id: turn_index}
     print("  Fetching messages...", end=" ", flush=True)
     msg_docs = _scroll_all(
-        endpoint, "memory-lpg-nodes",
+        endpoint, nodes_index,
         {"term": {"labels": "Message"}},
         fields=["id", "properties.metadata"],
         username=username, password=password, verify_ssl=verify_ssl,
@@ -181,7 +185,7 @@ def export_entities(args):
     # Include full properties so enrichment/geocoding data is preserved.
     print("  Fetching entities...", end=" ", flush=True)
     entity_docs = _scroll_all(
-        endpoint, "memory-lpg-nodes",
+        endpoint, nodes_index,
         {"term": {"labels": "Entity"}},
         fields=["id", "labels", "properties"],
         username=username, password=password, verify_ssl=verify_ssl,
@@ -200,7 +204,7 @@ def export_entities(args):
     # Step 5: Fetch all MENTIONS edges → message_node_id → [(entity_node_id, props)]
     print("  Fetching MENTIONS edges...", end=" ", flush=True)
     mentions_docs = _scroll_all(
-        endpoint, "memory-lpg-edges",
+        endpoint, edges_index,
         {"term": {"type": "MENTIONS"}},
         fields=["source", "target", "properties"],
         username=username, password=password, verify_ssl=verify_ssl,
@@ -210,7 +214,7 @@ def export_entities(args):
     # Step 6: Fetch all RELATED_TO edges → relationships between entities
     print("  Fetching RELATED_TO edges...", end=" ", flush=True)
     rel_docs = _scroll_all(
-        endpoint, "memory-lpg-edges",
+        endpoint, edges_index,
         {"term": {"type": "RELATED_TO"}},
         fields=["source", "target", "properties"],
         username=username, password=password, verify_ssl=verify_ssl,
@@ -388,6 +392,7 @@ def import_entities(args):
 
     # Build MemoryClient settings
     endpoint = args.endpoint
+    database = args.database
     username = os.getenv("MEMORY_STORE_USERNAME")
     password = os.getenv("MEMORY_STORE_PASSWORD")
     verify_ssl = os.getenv("MEMORY_STORE_VERIFY_SSL", "true").lower() not in ("false", "0", "no")
@@ -396,6 +401,7 @@ def import_entities(args):
         backend="memory_store",
         memory_store=MemoryStoreConfig(
             endpoint=endpoint,
+            database=database,
             username=username,
             password=SecretStr(password) if password else None,
             verify_ssl=verify_ssl,
@@ -603,6 +609,11 @@ def main():
         "--endpoint",
         default=os.getenv("MEMORY_STORE_ENDPOINT", "https://localhost:9200"),
         help="Memory Store endpoint",
+    )
+    parser.add_argument(
+        "--database",
+        default=os.getenv("MEMORY_STORE_DATABASE", "memory"),
+        help="Memory Store database name (index prefix)",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)

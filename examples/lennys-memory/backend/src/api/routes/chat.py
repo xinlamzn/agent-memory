@@ -233,23 +233,21 @@ async def stream_chat_response(
             trace_id = trace.id
             logger.info(f"Started reasoning trace: {trace_id}")
 
-        # Run agent with streaming and conversation history
-        full_response = ""
+        # Run agent (non-streaming) to support multi-turn tool calling
         agent = get_podcast_agent()
 
-        async with agent.run_stream(
+        result = await agent.run(
             request.message,
             deps=deps,
             message_history=message_history if message_history else None,
-        ) as result:
-            # Stream text tokens
-            async for text in result.stream_text(delta=True):
-                full_response += text
-                yield {"data": json.dumps({"type": "token", "content": text})}
+        )
 
-            # Process messages for tool calls and record to reasoning memory
-            step_number = 0
-            for msg in result.all_messages():
+        # Get the final text response
+        full_response = str(result.output)
+
+        # Process messages for tool calls and record to reasoning memory
+        step_number = 0
+        for msg in result.all_messages():
                 if isinstance(msg, ModelResponse):
                     for part in msg.parts:
                         if isinstance(part, ToolCallPart):
@@ -355,6 +353,11 @@ async def stream_chat_response(
                                 "duration_ms": duration_ms,
                             }
                             yield {"data": json.dumps(event)}
+
+        # Emit the final text response as token events
+        if full_response:
+            # Send as a single token for now (non-streaming)
+            yield {"data": json.dumps({"type": "token", "content": full_response})}
 
         # Store assistant response in short-term memory
         if memory_enabled and memory:

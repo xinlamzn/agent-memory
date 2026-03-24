@@ -775,6 +775,22 @@ class MemoryClient:
                 model_name=config.model,
                 device=config.device,
             )
+        elif config.provider == EmbeddingProvider.BEDROCK:
+            from neo4j_agent_memory.embeddings.bedrock import BedrockEmbedder
+
+            return BedrockEmbedder(
+                model=config.model,
+                region_name=config.aws_region,
+                batch_size=config.batch_size,
+            )
+        elif config.provider == EmbeddingProvider.VERTEX_AI:
+            from neo4j_agent_memory.embeddings.vertex_ai import VertexAIEmbedder
+
+            return VertexAIEmbedder(
+                model=config.model,
+                project_id=config.project_id,
+                location=config.location,
+            )
         else:
             return None
 

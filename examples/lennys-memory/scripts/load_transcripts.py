@@ -937,6 +937,11 @@ Performance Tips:
         help="Memory Store endpoint (default: from MEMORY_STORE_ENDPOINT env var)",
     )
     parser.add_argument(
+        "--database",
+        default=os.getenv("MEMORY_STORE_DATABASE", "lennys-pods"),
+        help="Memory Store database name (default: from MEMORY_STORE_DATABASE env var or 'lennys-pods')",
+    )
+    parser.add_argument(
         "--aws-region",
         default=os.getenv("AWS_REGION", "us-west-2"),
         help="AWS region for Bedrock embeddings (default: from AWS_REGION env var)",
@@ -1028,6 +1033,7 @@ Performance Tips:
     print(f"  {color('Data directory:', Colors.DIM)} {args.data_dir}")
     print(f"  {color('Available files:', Colors.DIM)} {len(files)}")
     print(f"  {color('Memory Store:', Colors.DIM)} {args.memory_store_endpoint}")
+    print(f"  {color('Database:', Colors.DIM)} {args.database}")
     print(f"  {color('AWS Region:', Colors.DIM)} {args.aws_region}")
     print(f"  {color('Sample size:', Colors.DIM)} {args.sample or 'all'}")
     print(
@@ -1076,6 +1082,7 @@ Performance Tips:
         backend="memory_store",
         memory_store=MemoryStoreConfig(
             endpoint=args.memory_store_endpoint,
+            database=args.database,
             username=memory_store_username,
             password=SecretStr(memory_store_password) if memory_store_password else None,
             verify_ssl=memory_store_verify_ssl,

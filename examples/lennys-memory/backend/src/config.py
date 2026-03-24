@@ -17,6 +17,7 @@ class Settings(BaseSettings):
 
     # Memory Store Configuration
     memory_store_endpoint: str = Field(default="https://localhost:9200")
+    memory_store_database: str = Field(default="lennys-pods")
     memory_store_username: str | None = Field(default=None)
     memory_store_password: SecretStr | None = Field(default=None)
     memory_store_verify_ssl: bool = Field(default=True)

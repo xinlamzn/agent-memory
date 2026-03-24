@@ -55,6 +55,7 @@ async def init_memory_client() -> MemoryClient | None:
         backend="memory_store",
         memory_store=MemoryStoreConfig(
             endpoint=settings.memory_store_endpoint,
+            database=settings.memory_store_database,
             username=settings.memory_store_username,
             password=settings.memory_store_password,
             verify_ssl=settings.memory_store_verify_ssl,

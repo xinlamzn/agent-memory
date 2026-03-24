@@ -834,6 +834,7 @@ class ReasoningMemory(BaseMemory[ReasoningStep]):
             task_embedding,
             limit=fetch_limit,
             threshold=threshold,
+            query_text=task,
         )
 
         traces = []

@@ -280,6 +280,7 @@ def get_podcast_agent() -> Agent[AgentDeps, str]:
         "bedrock:us.anthropic.claude-sonnet-4-20250514-v1:0",
         deps_type=AgentDeps,
         system_prompt=SYSTEM_PROMPT,
+        end_strategy="exhaustive",
     )
 
     # Add dynamic memory context via decorator

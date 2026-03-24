@@ -285,6 +285,7 @@ class GraphBackend(Protocol):
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
+        query_text: str | None = None,
     ) -> list[dict[str, Any]]:
         """Semantic vector similarity search.
 
@@ -295,6 +296,10 @@ class GraphBackend(Protocol):
             limit: Maximum results.
             threshold: Minimum similarity score.
             filters: Additional property filters applied post-search.
+            query_text: Optional text query for hybrid (vector + BM25) search.
+                When provided, backends that support hybrid search will combine
+                vector similarity with BM25 text matching for improved recall.
+                Backends that don't support hybrid search may ignore this.
 
         Returns:
             List of dicts, each containing node properties plus a
