@@ -122,37 +122,34 @@ async def _get_message_context(
 ) -> dict[str, list[dict[str, str]]]:
     """Get surrounding messages for context.
 
-    Uses NEXT_MESSAGE relationships if available, otherwise falls back to
-    timestamp-based ordering.
+    Uses NEXT_MESSAGE traversal when available.  Falls back gracefully
+    for backends that do not support the relationship.
     """
     try:
-        # Try to get context using message relationships
-        query = """
-        MATCH (m:Message)
-        WHERE elementId(m) = $message_id
-        OPTIONAL MATCH (before:Message)-[:NEXT_MESSAGE*1..{context}]->(m)
-        OPTIONAL MATCH (m)-[:NEXT_MESSAGE*1..{context}]->(after:Message)
-        WITH m,
-             collect(DISTINCT before)[0..{context}] AS before_msgs,
-             collect(DISTINCT after)[0..{context}] AS after_msgs
-        RETURN [b IN before_msgs | {{
-            content: left(b.content, 200),
-            speaker: b.metadata.speaker
-        }}] AS context_before,
-        [a IN after_msgs | {{
-            content: left(a.content, 200),
-            speaker: a.metadata.speaker
-        }}] AS context_after
-        """.replace("{context}", str(context_size))
-
-        results = await ctx.deps.client._client.execute_read(query, {"message_id": message_id})
-
-        if results and results[0]:
-            return {
-                "before": results[0].get("context_before", []),
-                "after": results[0].get("context_after", []),
-            }
-        return {"before": [], "after": []}
+        graph = ctx.deps.client.backend.graph
+        neighbours = await graph.traverse(
+            "Message",
+            message_id,
+            relationship_types=["NEXT_MESSAGE"],
+            direction="both",
+            target_labels=["Message"],
+            depth=context_size,
+            limit=context_size * 2,
+        )
+        before: list[dict[str, str]] = []
+        after: list[dict[str, str]] = []
+        for n in neighbours:
+            content = (n.get("content") or "")[:200]
+            meta = n.get("metadata", {})
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+            speaker = meta.get("speaker", "Unknown")
+            # Without directional info from traverse, just return as context
+            after.append({"content": content, "speaker": speaker})
+        return {"before": before, "after": after[:context_size]}
     except Exception:
         return {"before": [], "after": []}
 
@@ -209,65 +206,24 @@ async def search_by_speaker(
             if results:
                 return results
 
-        # Fallback: Use Cypher with fuzzy speaker matching
-        query = """
-        MATCH (c:Conversation)-[:HAS_MESSAGE]->(m:Message)
-        WHERE c.session_id STARTS WITH 'lenny-podcast-'
-        AND m.metadata IS NOT NULL
-        AND (
-            m.metadata CONTAINS $speaker_pattern
-            OR toLower(m.metadata) CONTAINS toLower($speaker_lower)
+        # Fallback: broad semantic search including speaker name
+        fallback_query = f"{speaker} {topic}" if topic else speaker
+        messages = await ctx.deps.client.short_term.search_messages(
+            query=fallback_query,
+            limit=limit,
+            threshold=0.4,
+            metadata_filters={"source": "lenny_podcast"},
         )
-        """
-        params: dict[str, Any] = {
-            "speaker_pattern": f'"speaker": "{speaker}"',
-            "speaker_lower": speaker.lower(),
-        }
-
-        if topic:
-            query += " AND toLower(m.content) CONTAINS toLower($topic)"
-            params["topic"] = topic
-
-        query += """
-        RETURN m.content AS content,
-               m.metadata AS metadata,
-               c.session_id AS session_id
-        ORDER BY m.created_at DESC
-        LIMIT $limit
-        """
-        params["limit"] = limit
-
-        results = await ctx.deps.client._client.execute_read(query, params)
-
-        formatted_results = []
-        for r in results:
-            # Parse metadata JSON to extract speaker and episode info
-            metadata = {}
-            if r.get("metadata"):
-                try:
-                    metadata = json.loads(r["metadata"])
-                except (json.JSONDecodeError, TypeError):
-                    metadata = {}
-
-            # Extract episode guest from session_id (format: lenny-podcast-guest-name)
-            session_id = r.get("session_id", "")
-            episode_guest = metadata.get("episode_guest", "")
-            if not episode_guest and session_id.startswith("lenny-podcast-"):
-                # Convert session_id back to guest name (e.g., "lenny-podcast-julie-zhuo" -> "Julie Zhuo")
-                guest_part = session_id.replace("lenny-podcast-", "")
-                episode_guest = " ".join(word.capitalize() for word in guest_part.split("-"))
-
-            formatted_results.append(
-                {
-                    "content": (
-                        r["content"][:500] + "..." if len(r["content"]) > 500 else r["content"]
-                    ),
-                    "speaker": metadata.get("speaker", "Unknown"),
-                    "episode_guest": episode_guest or "Unknown",
-                }
-            )
-
-        return formatted_results
+        return [
+            {
+                "content": (
+                    msg.content[:500] + "..." if len(msg.content) > 500 else msg.content
+                ),
+                "speaker": msg.metadata.get("speaker", "Unknown"),
+                "episode_guest": msg.metadata.get("episode_guest", "Unknown"),
+            }
+            for msg in messages
+        ]
     except Exception as e:
         return [{"error": f"Search failed: {str(e)}"}]
 
@@ -336,25 +292,18 @@ async def get_episode_list(ctx: RunContext[AgentDeps]) -> list[dict[str, Any]]:
         return [{"error": "Memory client not available"}]
 
     try:
-        query = """
-        MATCH (c:Conversation)
-        WHERE c.session_id STARTS WITH 'lenny-podcast-'
-        OPTIONAL MATCH (c)-[:HAS_MESSAGE]->(m:Message)
-        WITH c, count(m) AS message_count
-        RETURN c.session_id AS session_id,
-               message_count
-        ORDER BY c.session_id
-        """
-
-        results = await ctx.deps.client._client.execute_read(query)
+        sessions = await ctx.deps.client.short_term.list_sessions(
+            prefix="lenny-podcast-",
+            limit=500,
+        )
 
         return [
             {
-                "guest": r["session_id"].replace("lenny-podcast-", "").replace("-", " ").title(),
-                "session_id": r["session_id"],
-                "message_count": r["message_count"],
+                "guest": s.session_id.replace("lenny-podcast-", "").replace("-", " ").title(),
+                "session_id": s.session_id,
+                "message_count": s.message_count,
             }
-            for r in results
+            for s in sessions
         ]
     except Exception as e:
         return [{"error": f"Query failed: {str(e)}"}]
@@ -362,6 +311,9 @@ async def get_episode_list(ctx: RunContext[AgentDeps]) -> list[dict[str, Any]]:
 
 async def get_speaker_list(ctx: RunContext[AgentDeps]) -> list[dict[str, Any]]:
     """Get list of all unique speakers across episodes.
+
+    Derives speakers from session IDs: Lenny is the host in all episodes,
+    and each session corresponds to a guest.
 
     Args:
         ctx: The agent run context.
@@ -373,35 +325,16 @@ async def get_speaker_list(ctx: RunContext[AgentDeps]) -> list[dict[str, Any]]:
         return [{"error": "Memory client not available"}]
 
     try:
-        # Query to extract unique speakers from message metadata
-        # Note: This assumes metadata is stored as JSON string
-        query = """
-        MATCH (c:Conversation)-[:HAS_MESSAGE]->(m:Message)
-        WHERE c.session_id STARTS WITH 'lenny-podcast-'
-        AND m.metadata IS NOT NULL
-        WITH m.metadata AS meta
-        WITH meta
-        WHERE meta CONTAINS '"speaker":'
-        RETURN DISTINCT meta
-        LIMIT 500
-        """
+        sessions = await ctx.deps.client.short_term.list_sessions(
+            prefix="lenny-podcast-",
+            limit=500,
+        )
 
-        results = await ctx.deps.client._client.execute_read(query)
-
-        # Parse speaker names from metadata
-        import json
-
-        speakers: dict[str, int] = {}
-        for r in results:
-            try:
-                if isinstance(r["meta"], str):
-                    metadata = json.loads(r["meta"])
-                else:
-                    metadata = r["meta"]
-                speaker = metadata.get("speaker", "Unknown")
-                speakers[speaker] = speakers.get(speaker, 0) + 1
-            except (json.JSONDecodeError, TypeError):
-                pass
+        # Lenny appears in every episode; each guest appears once
+        speakers: dict[str, int] = {"Lenny Rachitsky": len(sessions)}
+        for s in sessions:
+            guest = s.session_id.replace("lenny-podcast-", "").replace("-", " ").title()
+            speakers[guest] = speakers.get(guest, 0) + 1
 
         return [
             {"speaker": name, "appearance_count": count}
@@ -425,10 +358,30 @@ async def get_memory_stats(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
 
     try:
         stats = await ctx.deps.client.get_stats()
+
+        # Handle both Neo4j format (flat keys) and Memory Store format (nested)
+        conversations = stats.get("conversations", 0)
+        messages = stats.get("messages", 0)
+        entities = stats.get("entities", 0)
+
+        # Memory Store returns stats grouped by namespace/label as bucket lists
+        if not conversations and "by_labels" in stats:
+            by_labels = stats["by_labels"]
+            # Handle both dict format and bucket list format
+            if isinstance(by_labels, dict) and "buckets" in by_labels:
+                label_map = {b["key"]: b["count"] for b in by_labels["buckets"]}
+            elif isinstance(by_labels, dict):
+                label_map = by_labels
+            else:
+                label_map = {}
+            conversations = label_map.get("Conversation", 0)
+            messages = label_map.get("Message", 0)
+            entities = label_map.get("Entity", 0)
+
         return {
-            "conversations": stats.get("conversations", 0),
-            "messages": stats.get("messages", 0),
-            "entities": stats.get("entities", 0),
+            "conversations": conversations,
+            "messages": messages,
+            "entities": entities,
             "note": "These are podcast transcript segments loaded into memory",
         }
     except Exception as e:
@@ -464,57 +417,35 @@ async def search_entities(
         return [{"error": "Memory client not available"}]
 
     try:
-        # Use direct Cypher query to get all entity properties including enriched_description
-        # (The library's search_entities doesn't map enriched_description to the Entity object)
-        embedder = ctx.deps.client.long_term._embedder
-        if embedder is None:
-            return [{"error": "Embedder not available"}]
+        entities = await ctx.deps.client.long_term.search_entities(
+            query=query,
+            entity_types=[entity_type.upper()] if entity_type else None,
+            limit=limit * 2 if collapse_duplicates else limit,
+            threshold=0.5,
+        )
 
-        query_embedding = await embedder.embed(query)
+        if collapse_duplicates and entities:
+            entities = await _collapse_duplicate_entities(ctx, entities, limit)
 
-        # Build the Cypher query with optional type filter
-        cypher = """
-        CALL db.index.vector.queryNodes('entity_embedding_idx', $limit, $embedding)
-        YIELD node, score
-        WHERE score >= $threshold
-        """
-        if entity_type:
-            cypher += " AND node.type = $entity_type"
-        cypher += """
-        RETURN node.id AS id,
-               node.name AS name,
-               node.type AS type,
-               node.subtype AS subtype,
-               node.enriched_description AS enriched_description,
-               node.wikipedia_url AS wikipedia_url,
-               score
-        ORDER BY score DESC
-        """
+        results = []
+        for e in entities[:limit]:
+            metadata = getattr(e, "metadata", {}) or {}
+            enriched_desc = getattr(e, "enriched_description", None) or metadata.get(
+                "enriched_description", ""
+            )
+            wiki_url = getattr(e, "wikipedia_url", None) or metadata.get("wikipedia_url")
+            results.append(
+                {
+                    "name": e.name,
+                    "type": e.type,
+                    "subtype": e.subtype,
+                    "description": enriched_desc or (e.description or ""),
+                    "wikipedia_url": wiki_url,
+                    "enriched": bool(enriched_desc),
+                }
+            )
 
-        params = {
-            "embedding": query_embedding,
-            "limit": limit * 2 if collapse_duplicates else limit,
-            "threshold": 0.5,
-            "entity_type": entity_type.upper() if entity_type else None,
-        }
-
-        results = await ctx.deps.client._client.execute_read(cypher, params)
-
-        if collapse_duplicates and results:
-            # Collapse SAME_AS clusters to canonical entities
-            results = await _collapse_duplicate_entity_results(ctx, results, limit)
-
-        return [
-            {
-                "name": r["name"],
-                "type": r["type"],
-                "subtype": r.get("subtype"),
-                "description": r.get("enriched_description") or "",
-                "wikipedia_url": r.get("wikipedia_url"),
-                "enriched": bool(r.get("enriched_description")),
-            }
-            for r in results[:limit]
-        ]
+        return results
     except Exception as e:
         return [{"error": f"Entity search failed: {str(e)}"}]
 
@@ -615,55 +546,40 @@ async def get_entity_context(
                 # Use the best match
                 entity = entities[0]
 
-        # Still not found? Try case-insensitive Cypher search
-        if not entity:
-            query = """
-            MATCH (e:Entity)
-            WHERE toLower(e.name) CONTAINS toLower($name)
-               OR toLower($name) CONTAINS toLower(e.name)
-            RETURN e
-            ORDER BY size(e.name) ASC
-            LIMIT 1
-            """
-            results = await ctx.deps.client._client.execute_read(query, {"name": entity_name})
-            if results:
-                # Parse the entity from Cypher result
-                entity = await ctx.deps.client.long_term.get_entity_by_name(results[0]["e"]["name"])
-
         if not entity:
             return {
                 "error": f"Entity '{entity_name}' not found. Try searching with search_entities tool first."
             }
 
-        # Get mentions from the graph (filter to podcast sessions only)
-        query = """
-        MATCH (e:Entity {name: $name})<-[:MENTIONS]-(m:Message)<-[:HAS_MESSAGE]-(c:Conversation)
-        WHERE c.session_id STARTS WITH 'lenny-podcast-'
-        RETURN m.content AS content,
-               m.metadata AS metadata,
-               c.session_id AS session_id
-        LIMIT 5
-        """
-        mentions = await ctx.deps.client._client.execute_read(query, {"name": entity_name})
+        # Get mentions via graph traversal (Entity <-[MENTIONS]- Message)
+        graph = ctx.deps.client.backend.graph
+        mention_nodes = await graph.traverse(
+            "Entity",
+            str(entity.id),
+            relationship_types=["MENTIONS"],
+            direction="incoming",
+            target_labels=["Message"],
+            limit=5,
+        )
 
         mention_list = []
-        for m in mentions:
+        for m in mention_nodes:
             metadata = m.get("metadata", {})
             if isinstance(metadata, str):
                 try:
                     metadata = json.loads(metadata)
                 except json.JSONDecodeError:
                     metadata = {}
+            content = m.get("content", "")
+            session_id = metadata.get("session_id", "")
+            episode_guest = metadata.get("episode_guest", "")
+            if not episode_guest and session_id.startswith("lenny-podcast-"):
+                episode_guest = session_id.replace("lenny-podcast-", "").replace("-", " ").title()
             mention_list.append(
                 {
-                    "content": m["content"][:300] + "..."
-                    if len(m["content"]) > 300
-                    else m["content"],
+                    "content": content[:300] + "..." if len(content) > 300 else content,
                     "speaker": metadata.get("speaker", "Unknown"),
-                    "episode": m["session_id"]
-                    .replace("lenny-podcast-", "")
-                    .replace("-", " ")
-                    .title(),
+                    "episode": episode_guest or "Unknown",
                 }
             )
 
@@ -754,37 +670,31 @@ async def find_related_entities(
         return [{"error": "Memory client not available"}]
 
     try:
-        # First, resolve the entity name using fuzzy matching
+        # Resolve entity name using the high-level API
         resolved_name = await _resolve_entity_name(ctx, entity_name)
         if not resolved_name:
             return [{"error": f"Entity '{entity_name}' not found"}]
 
-        # Find entities that co-occur in the same messages (podcast sessions only)
-        query = """
-        MATCH (e1:Entity {name: $name})<-[:MENTIONS]-(m:Message)<-[:HAS_MESSAGE]-(c:Conversation)
-        WHERE c.session_id STARTS WITH 'lenny-podcast-'
-        MATCH (m)-[:MENTIONS]->(e2:Entity)
-        WHERE e1 <> e2
-        WITH e2, count(m) AS co_occurrences
-        ORDER BY co_occurrences DESC
-        LIMIT $limit
-        RETURN e2.name AS name, e2.type AS type, e2.subtype AS subtype,
-               e2.enriched_description AS enriched_description, co_occurrences
-        """
-        results = await ctx.deps.client._client.execute_read(
-            query, {"name": resolved_name, "limit": limit}
-        )
+        # Use get_entity_relationships which uses backend-neutral traverse
+        related = await ctx.deps.client.long_term.get_entity_relationships(resolved_name)
 
-        return [
-            {
-                "name": r["name"],
-                "type": r["type"],
-                "subtype": r["subtype"],
-                "enriched_description": r["enriched_description"],
-                "co_occurrences": r["co_occurrences"],
-            }
-            for r in results
-        ]
+        results = []
+        for entity, rel in related[:limit]:
+            metadata = getattr(entity, "metadata", {}) or {}
+            enriched_desc = getattr(entity, "enriched_description", None) or metadata.get(
+                "enriched_description"
+            )
+            results.append(
+                {
+                    "name": entity.name,
+                    "type": entity.type,
+                    "subtype": entity.subtype,
+                    "enriched_description": enriched_desc,
+                    "co_occurrences": 1,  # Relationship-based (not counted by co-occurrence)
+                }
+            )
+
+        return results
     except Exception as e:
         return [{"error": f"Failed to find related entities: {str(e)}"}]
 
@@ -802,27 +712,14 @@ async def _resolve_entity_name(
     if entity:
         return entity.name
 
-    # Try vector search
+    # Try vector search for fuzzy matching
     entities = await ctx.deps.client.long_term.search_entities(
         query=entity_name,
         limit=3,
-        threshold=0.5,
+        threshold=0.4,  # Lower threshold for name resolution
     )
     if entities:
         return entities[0].name
-
-    # Try case-insensitive substring match
-    query = """
-    MATCH (e:Entity)
-    WHERE toLower(e.name) CONTAINS toLower($name)
-       OR toLower($name) CONTAINS toLower(e.name)
-    RETURN e.name AS name
-    ORDER BY size(e.name) ASC
-    LIMIT 1
-    """
-    results = await ctx.deps.client._client.execute_read(query, {"name": entity_name})
-    if results:
-        return results[0]["name"]
 
     return None
 
@@ -846,35 +743,44 @@ async def get_most_mentioned_entities(
         return [{"error": "Memory client not available"}]
 
     try:
-        # Count mentions from podcast sessions only
-        query = """
-        MATCH (e:Entity)<-[r:MENTIONS]-(m:Message)<-[:HAS_MESSAGE]-(c:Conversation)
-        WHERE c.session_id STARTS WITH 'lenny-podcast-'
-        AND ($type IS NULL OR e.type = $type)
-        WITH e, count(r) AS mentions
-        ORDER BY mentions DESC
-        LIMIT $limit
-        RETURN e.name AS name, e.type AS type,
-               e.subtype AS subtype,
-               e.enriched_description AS enriched_description,
-               e.wikipedia_url AS wikipedia_url,
-               mentions
-        """
-        results = await ctx.deps.client._client.execute_read(
-            query, {"type": entity_type, "limit": limit}
+        # Query entity nodes and sort by mention_count property
+        graph = ctx.deps.client.backend.graph
+        filters: dict[str, Any] = {}
+        if entity_type:
+            filters["type"] = entity_type.upper()
+
+        entities = await graph.query_nodes(
+            "Entity",
+            filters=filters if filters else None,
+            order_by="mention_count",
+            order_dir="desc",
+            limit=limit,
         )
 
-        return [
-            {
-                "name": r["name"],
-                "type": r["type"],
-                "subtype": r["subtype"],
-                "description": r.get("enriched_description") or "",
-                "wikipedia_url": r["wikipedia_url"],
-                "mentions": r["mentions"],
-            }
-            for r in results
-        ]
+        results = []
+        for e in entities:
+            metadata = e.get("metadata", {})
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            enriched_desc = e.get("enriched_description") or metadata.get(
+                "enriched_description", ""
+            )
+            wiki_url = e.get("wikipedia_url") or metadata.get("wikipedia_url")
+            results.append(
+                {
+                    "name": e.get("name", "Unknown"),
+                    "type": e.get("type", "Unknown"),
+                    "subtype": e.get("subtype"),
+                    "description": enriched_desc,
+                    "wikipedia_url": wiki_url,
+                    "mentions": e.get("mention_count", 0),
+                }
+            )
+
+        return results
     except Exception as e:
         return [{"error": f"Failed to get top entities: {str(e)}"}]
 
@@ -909,38 +815,20 @@ async def search_locations(
         if episode_guest:
             session_id = _guest_to_session_id(episode_guest)
 
-        # Query LOCATION entities - coordinates stored in location point property
-        cypher_query = """
-        MATCH (e:Entity)
-        WHERE e.type = 'LOCATION'
-        AND e.location IS NOT NULL
-        """
-        params: dict[str, Any] = {}
+        # Use the backend-neutral get_locations utility
+        locations = await ctx.deps.client.get_locations(
+            session_id=session_id,
+            has_coordinates=True,
+            limit=limit,
+        )
 
-        if session_id:
-            cypher_query += """
-            AND EXISTS {
-                MATCH (c:Conversation)-[:HAS_MESSAGE]->(m:Message)-[:MENTIONS]->(e)
-                WHERE c.session_id = $session_id
-            }
-            """
-            params["session_id"] = session_id
-
+        # Apply optional query filter client-side
         if query:
-            cypher_query += """
-            AND toLower(e.name) CONTAINS toLower($query)
-            """
-            params["query"] = query
-
-        cypher_query += """
-        RETURN e.id AS id, e.name AS name, e.type AS type, e.subtype AS subtype,
-               e.location.y AS latitude, e.location.x AS longitude,
-               e.enriched_description AS enriched_description
-        LIMIT $limit
-        """
-        params["limit"] = limit
-
-        locations = await ctx.deps.client._client.execute_read(cypher_query, params)
+            query_lower = query.lower()
+            locations = [
+                loc for loc in locations
+                if query_lower in loc.get("name", "").lower()
+            ]
 
         return [
             {
@@ -949,9 +837,9 @@ async def search_locations(
                 "subtype": loc.get("subtype"),
                 "latitude": loc.get("latitude"),
                 "longitude": loc.get("longitude"),
-                "description": loc.get("enriched_description") or "",
+                "description": loc.get("enriched_description") or loc.get("description") or "",
             }
-            for loc in locations
+            for loc in locations[:limit]
         ]
     except Exception as e:
         return [{"error": f"Location search failed: {str(e)}"}]
@@ -1045,22 +933,11 @@ async def get_episode_locations(
     try:
         session_id = _guest_to_session_id(episode_guest)
 
-        # Query LOCATION entities for this episode - coordinates in location point property
-        cypher_query = """
-        MATCH (c:Conversation)-[:HAS_MESSAGE]->(m:Message)-[:MENTIONS]->(e:Entity)
-        WHERE c.session_id = $session_id
-        AND e.type = 'LOCATION'
-        AND e.location IS NOT NULL
-        WITH e, count(m) AS mention_count
-        RETURN e.id AS id, e.name AS name, e.type AS type, e.subtype AS subtype,
-               e.location.y AS latitude, e.location.x AS longitude,
-               e.enriched_description AS enriched_description,
-               mention_count
-        ORDER BY mention_count DESC
-        LIMIT 100
-        """
-        locations = await ctx.deps.client._client.execute_read(
-            cypher_query, {"session_id": session_id}
+        # Use the backend-neutral get_locations utility with session filter
+        locations = await ctx.deps.client.get_locations(
+            session_id=session_id,
+            has_coordinates=True,
+            limit=100,
         )
 
         return [
@@ -1070,8 +947,8 @@ async def get_episode_locations(
                 "subtype": loc.get("subtype"),
                 "latitude": loc.get("latitude"),
                 "longitude": loc.get("longitude"),
-                "description": loc.get("enriched_description") or "",
-                "mentions": loc.get("mention_count"),
+                "description": loc.get("enriched_description") or loc.get("description") or "",
+                "mentions": loc.get("mention_count", 0),
             }
             for loc in locations
         ]
@@ -1100,51 +977,44 @@ async def find_location_path(
         return {"error": "Memory client not available"}
 
     try:
-        query = """
-        MATCH (start:Entity {type: 'LOCATION'})
-        WHERE toLower(start.name) CONTAINS toLower($from_loc)
-        WITH start LIMIT 1
-        MATCH (end:Entity {type: 'LOCATION'})
-        WHERE toLower(end.name) CONTAINS toLower($to_loc)
-        WITH start, end LIMIT 1
-        MATCH path = shortestPath((start)-[*..6]-(end))
-        RETURN start.name AS from_location,
-               start.location.latitude AS from_lat,
-               start.location.longitude AS from_lon,
-               end.name AS to_location,
-               end.location.latitude AS to_lat,
-               end.location.longitude AS to_lon,
-               [n IN nodes(path) |
-                CASE
-                    WHEN n:Entity THEN {type: 'entity', name: n.name, entity_type: n.type}
-                    WHEN n:Message THEN {type: 'message', content: left(n.content, 100)}
-                    WHEN n:Conversation THEN {type: 'conversation', id: n.session_id}
-                    ELSE {type: 'unknown'}
-                END
-               ] AS path_nodes,
-               length(path) AS path_length
-        """
-        results = await ctx.deps.client._client.execute_read(
-            query, {"from_loc": from_location, "to_loc": to_location}
+        # Find both locations
+        all_locs = await ctx.deps.client.get_locations(has_coordinates=True, limit=500)
+
+        from_loc = None
+        to_loc = None
+        for loc in all_locs:
+            name = loc.get("name", "").lower()
+            if from_location.lower() in name and from_loc is None:
+                from_loc = loc
+            if to_location.lower() in name and to_loc is None:
+                to_loc = loc
+
+        if not from_loc:
+            return {"error": f"Location '{from_location}' not found"}
+        if not to_loc:
+            return {"error": f"Location '{to_location}' not found"}
+
+        # Calculate direct distance (graph path finding not available in backend-neutral API)
+        dist = _haversine_distance(
+            from_loc.get("latitude", 0),
+            from_loc.get("longitude", 0),
+            to_loc.get("latitude", 0),
+            to_loc.get("longitude", 0),
         )
 
-        if not results:
-            return {"error": f"No path found between '{from_location}' and '{to_location}'"}
-
-        r = results[0]
         return {
             "from_location": {
-                "name": r["from_location"],
-                "latitude": r["from_lat"],
-                "longitude": r["from_lon"],
+                "name": from_loc.get("name"),
+                "latitude": from_loc.get("latitude"),
+                "longitude": from_loc.get("longitude"),
             },
             "to_location": {
-                "name": r["to_location"],
-                "latitude": r["to_lat"],
-                "longitude": r["to_lon"],
+                "name": to_loc.get("name"),
+                "latitude": to_loc.get("latitude"),
+                "longitude": to_loc.get("longitude"),
             },
-            "path_length": r["path_length"],
-            "path_nodes": r["path_nodes"],
+            "distance_km": round(dist, 1),
+            "note": "Direct distance shown. Graph path traversal requires Neo4j backend.",
         }
     except Exception as e:
         return {"error": f"Path finding failed: {str(e)}"}
@@ -1609,41 +1479,38 @@ async def _find_duplicates_fallback(
     entity_type: str | None,
     limit: int,
 ) -> list[dict[str, Any]]:
-    """Fallback duplicate detection using fuzzy string matching in Cypher."""
+    """Fallback duplicate detection using name comparison."""
     try:
-        type_filter = "AND e1.type = $entity_type" if entity_type else ""
-        query = f"""
-        MATCH (e1:Entity)
-        WHERE e1.name IS NOT NULL {type_filter}
-        WITH e1
-        MATCH (e2:Entity)
-        WHERE e2.name IS NOT NULL
-          AND id(e1) < id(e2)
-          AND e1.type = e2.type
-          AND (
-            toLower(e1.name) CONTAINS toLower(e2.name)
-            OR toLower(e2.name) CONTAINS toLower(e1.name)
-            OR apoc.text.levenshteinSimilarity(toLower(e1.name), toLower(e2.name)) > 0.8
-          )
-        RETURN e1.name AS name1, e1.type AS type1, elementId(e1) AS id1,
-               e2.name AS name2, e2.type AS type2, elementId(e2) AS id2,
-               apoc.text.levenshteinSimilarity(toLower(e1.name), toLower(e2.name)) AS similarity
-        ORDER BY similarity DESC
-        LIMIT $limit
-        """
-        results = await ctx.deps.client._client.execute_read(
-            query, {"entity_type": entity_type, "limit": limit}
+        filters: dict[str, Any] = {}
+        if entity_type:
+            filters["type"] = entity_type.upper()
+
+        entities = await ctx.deps.client.backend.graph.query_nodes(
+            "Entity",
+            filters=filters if filters else None,
+            limit=500,
         )
 
-        return [
-            {
-                "entity1": {"id": r["id1"], "name": r["name1"], "type": r["type1"]},
-                "entity2": {"id": r["id2"], "name": r["name2"], "type": r["type2"]},
-                "similarity": round(r["similarity"], 3) if r["similarity"] else 0.8,
-                "status": "pending",
-            }
-            for r in results
-        ]
+        # Simple client-side duplicate detection by substring matching
+        pairs: list[dict[str, Any]] = []
+        for i, e1 in enumerate(entities):
+            for e2 in entities[i + 1:]:
+                if e1.get("type") != e2.get("type"):
+                    continue
+                n1 = (e1.get("name") or "").lower()
+                n2 = (e2.get("name") or "").lower()
+                if n1 and n2 and (n1 in n2 or n2 in n1):
+                    pairs.append(
+                        {
+                            "entity1": {"id": e1.get("id", ""), "name": e1.get("name", ""), "type": e1.get("type", "")},
+                            "entity2": {"id": e2.get("id", ""), "name": e2.get("name", ""), "type": e2.get("type", "")},
+                            "similarity": 0.8,
+                            "status": "pending",
+                        }
+                    )
+                    if len(pairs) >= limit:
+                        return pairs
+        return pairs
     except Exception as e:
         return [{"error": f"Fallback duplicate detection failed: {str(e)}"}]
 
@@ -1667,45 +1534,45 @@ async def get_entity_provenance(
         return {"error": "Memory client not available"}
 
     try:
-        query = """
-        MATCH (e:Entity)
-        WHERE toLower(e.name) = toLower($name)
-        WITH e LIMIT 1
-        OPTIONAL MATCH (e)-[r:EXTRACTED_FROM|MENTIONED_IN]->(m:Message)
-        OPTIONAL MATCH (m)-[:PART_OF]->(c:Conversation)
-        RETURN e.name AS entity_name,
-               e.type AS entity_type,
-               e.created_at AS created_at,
-               e.confidence AS confidence,
-               e.enrichment_provider AS enrichment_provider,
-               e.enriched_at AS enriched_at,
-               collect(DISTINCT {
-                   message_id: elementId(m),
-                   content_preview: left(m.content, 150),
-                   speaker: m.metadata.speaker,
-                   session_id: c.session_id,
-                   relationship_type: type(r)
-               })[0..5] AS sources
-        """
-        results = await ctx.deps.client._client.execute_read(query, {"name": entity_name})
+        # Resolve entity name
+        entity = await ctx.deps.client.long_term.get_entity_by_name(entity_name)
+        if not entity:
+            entities = await ctx.deps.client.long_term.search_entities(
+                query=entity_name, limit=1, threshold=0.5,
+            )
+            if entities:
+                entity = entities[0]
 
-        if not results:
+        if not entity:
             return {"error": f"Entity '{entity_name}' not found"}
 
-        r = results[0]
+        # Use the high-level provenance method
+        provenance = await ctx.deps.client.long_term.get_entity_provenance(entity)
+        metadata = getattr(entity, "metadata", {}) or {}
+
+        sources = []
+        for s in provenance.get("sources", [])[:5]:
+            sources.append(
+                {
+                    "message_id": s.get("message_id"),
+                    "content_preview": (s.get("content") or "")[:150],
+                    "confidence": s.get("confidence"),
+                }
+            )
+
         return {
             "entity": {
-                "name": r["entity_name"],
-                "type": r["entity_type"],
-                "created_at": str(r["created_at"]) if r["created_at"] else None,
-                "confidence": r["confidence"],
+                "name": entity.name,
+                "type": entity.type,
+                "created_at": entity.created_at.isoformat() if entity.created_at else None,
+                "confidence": entity.confidence,
             },
             "enrichment": {
-                "provider": r["enrichment_provider"],
-                "enriched_at": str(r["enriched_at"]) if r["enriched_at"] else None,
+                "provider": getattr(entity, "enrichment_provider", None) or metadata.get("enrichment_provider"),
+                "enriched_at": str(metadata.get("enriched_at")) if metadata.get("enriched_at") else None,
             },
-            "sources": [s for s in r["sources"] if s.get("message_id")],
-            "total_mentions": len([s for s in r["sources"] if s.get("message_id")]),
+            "sources": sources,
+            "total_mentions": len(sources),
         }
     except Exception as e:
         return {"error": f"Failed to get entity provenance: {str(e)}"}
@@ -1799,13 +1666,13 @@ async def get_conversation_context(
         return [{"error": "Memory client not available"}]
 
     try:
-        messages = await ctx.deps.client.short_term.get_conversation(
+        conv = await ctx.deps.client.short_term.get_conversation(
             session_id=ctx.deps.session_id,
             limit=limit,
         )
 
         results = []
-        for msg in messages:
+        for msg in conv.messages:
             msg_data = {
                 "role": msg.role,
                 "content": msg.content[:500] if len(msg.content) > 500 else msg.content,
@@ -1843,57 +1710,25 @@ async def list_podcast_sessions(
         return [{"error": "Memory client not available"}]
 
     try:
-        # Try using the library's list_sessions if available
-        try:
-            sessions = await ctx.deps.client.short_term.list_sessions(
-                prefix="lenny-podcast-",
-                limit=limit,
-            )
-            return [
-                {
-                    "session_id": s.session_id,
-                    "message_count": s.message_count,
-                    "created_at": s.created_at.isoformat() if s.created_at else None,
-                    "updated_at": s.updated_at.isoformat() if s.updated_at else None,
-                    "preview": s.preview[:100] if s.preview else None,
-                }
-                for s in sessions
-            ]
-        except AttributeError:
-            pass
+        # Map sort_by to the API's expected field names
+        valid_order_by = sort_by if sort_by in ("message_count", "created_at", "updated_at") else "message_count"
+        valid_order_dir = order if order in ("asc", "desc") else "desc"
 
-        # Fallback: Use direct Cypher query
-        order_clause = "DESC" if order == "desc" else "ASC"
-        sort_field = {
-            "message_count": "message_count",
-            "created_at": "c.created_at",
-            "updated_at": "c.updated_at",
-        }.get(sort_by, "message_count")
-
-        query = f"""
-        MATCH (c:Conversation)
-        WHERE c.session_id STARTS WITH 'lenny-podcast-'
-        OPTIONAL MATCH (c)-[:HAS_MESSAGE]->(m:Message)
-        WITH c, count(m) AS message_count
-        RETURN c.session_id AS session_id,
-               c.title AS title,
-               message_count,
-               c.created_at AS created_at,
-               c.updated_at AS updated_at
-        ORDER BY {sort_field} {order_clause}
-        LIMIT $limit
-        """
-        results = await ctx.deps.client._client.execute_read(query, {"limit": limit})
-
+        sessions = await ctx.deps.client.short_term.list_sessions(
+            prefix="lenny-podcast-",
+            limit=limit,
+            order_by=valid_order_by,
+            order_dir=valid_order_dir,
+        )
         return [
             {
-                "session_id": r["session_id"],
-                "title": r["title"],
-                "message_count": r["message_count"],
-                "created_at": str(r["created_at"]) if r["created_at"] else None,
-                "updated_at": str(r["updated_at"]) if r["updated_at"] else None,
+                "session_id": s.session_id,
+                "message_count": s.message_count,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+                "preview": (s.first_message_preview or "")[:100] or None,
             }
-            for r in results
+            for s in sessions
         ]
     except Exception as e:
         return [{"error": f"Failed to list sessions: {str(e)}"}]
@@ -1937,31 +1772,42 @@ async def get_episode_summary(
         except AttributeError:
             pass
 
-        # Fallback: Generate summary from entities and message stats
-        query = """
-        MATCH (c:Conversation {session_id: $session_id})
-        OPTIONAL MATCH (c)-[:HAS_MESSAGE]->(m:Message)
-        WITH c, count(m) AS message_count
-        OPTIONAL MATCH (m)-[:MENTIONS]->(e:Entity)
-        WITH c, message_count, collect(DISTINCT e.name)[0..10] AS entities
-        RETURN c.title AS title,
-               c.session_id AS session_id,
-               message_count,
-               entities
-        """
-        results = await ctx.deps.client._client.execute_read(query, {"session_id": session_id})
-
-        if not results:
+        # Fallback: Generate summary from session info and message search
+        graph = ctx.deps.client.backend.graph
+        conv_node = await graph.get_node("Conversation", filters={"session_id": session_id})
+        if not conv_node:
             return {"error": f"Episode with guest '{episode_guest}' not found"}
 
-        r = results[0]
+        # Count messages via traverse
+        msg_nodes = await graph.traverse(
+            "Conversation",
+            conv_node["id"],
+            relationship_types=["HAS_MESSAGE"],
+            target_labels=["Message"],
+            direction="outgoing",
+            limit=10,
+        )
+
+        # Get entity mentions from a sample of messages
+        entity_names: list[str] = []
+        for msg in msg_nodes[:5]:
+            try:
+                entities_for_msg = await ctx.deps.client.long_term.get_entities_from_message(
+                    msg.get("id", "")
+                )
+                for ent, _ in entities_for_msg:
+                    if ent.name not in entity_names:
+                        entity_names.append(ent.name)
+            except Exception:
+                pass
+
         return {
             "episode_guest": episode_guest,
-            "session_id": r["session_id"],
-            "title": r["title"],
-            "message_count": r["message_count"],
-            "key_entities": r["entities"] or [],
-            "summary": None,  # No AI summary available in fallback mode
+            "session_id": session_id,
+            "title": conv_node.get("title"),
+            "message_count": len(msg_nodes),
+            "key_entities": entity_names[:10],
+            "summary": None,
             "note": "Full AI summary requires conversation summarization feature.",
         }
     except Exception as e:
@@ -2028,31 +1874,7 @@ async def memory_graph_search(
                 "message": f"No messages found matching '{query}'",
             }
 
-        # Collect message IDs for graph traversal
-        message_ids = [str(msg.id) for msg in messages]
-
-        # Step 2: Find entities mentioned in these messages
-        entity_query = """
-        UNWIND $message_ids AS msg_id
-        MATCH (m:Message)
-        WHERE m.id = msg_id
-        OPTIONAL MATCH (m)-[mentions:MENTIONS]->(e:Entity)
-        RETURN
-            m.id AS message_id,
-            collect(DISTINCT {
-                id: e.id,
-                name: e.name,
-                type: e.type,
-                subtype: e.subtype,
-                enriched_description: e.enriched_description,
-                confidence: mentions.confidence
-            }) AS mentioned_entities
-        """
-
-        entity_results = await ctx.deps.client._client.execute_read(
-            entity_query,
-            {"message_ids": message_ids},
-        )
+        graph = ctx.deps.client.backend.graph
 
         # Build graph structure
         nodes: list[dict[str, Any]] = []
@@ -2066,7 +1888,6 @@ async def memory_graph_search(
             msg_id = f"msg-{msg.id}"
             if msg_id not in seen_node_ids:
                 metadata = msg.metadata or {}
-                # Include more content in the node
                 content = msg.content
                 if len(content) > 300:
                     content = content[:300] + "..."
@@ -2085,211 +1906,146 @@ async def memory_graph_search(
                 )
                 seen_node_ids.add(msg_id)
 
-        # Process entities mentioned in messages
-        for row in entity_results:
-            msg_id = f"msg-{row['message_id']}"
+        # Step 2: Find entities mentioned in these messages via traverse
+        for msg in messages:
+            try:
+                entities_for_msg = await ctx.deps.client.long_term.get_entities_from_message(
+                    str(msg.id)
+                )
+                msg_node_id = f"msg-{msg.id}"
+                for entity, extraction_info in entities_for_msg:
+                    entity_id = f"entity-{entity.id}"
+                    raw_entity_id = str(entity.id)
 
-            for entity in row.get("mentioned_entities", []):
-                if not entity or not entity.get("id"):
-                    continue
-                entity_id = f"entity-{entity['id']}"
-                raw_entity_id = entity["id"]
-
-                if entity_id not in seen_node_ids:
-                    nodes.append(
-                        {
-                            "id": entity_id,
-                            "label": entity.get("name", "Unknown"),
-                            "type": entity.get("type", "Entity"),
-                            "properties": {
-                                "subtype": entity.get("subtype"),
-                                "enriched_description": entity.get("enriched_description"),
-                            },
-                        }
-                    )
-                    seen_node_ids.add(entity_id)
-                    mentioned_entity_ids.append(raw_entity_id)
-
-                # Add MENTIONS relationship
-                rel_id = f"mentions-{msg_id}-{entity_id}"
-                if rel_id not in seen_rel_ids:
-                    relationships.append(
-                        {
-                            "id": rel_id,
-                            "from": msg_id,
-                            "to": entity_id,
-                            "type": "MENTIONS",
-                        }
-                    )
-                    seen_rel_ids.add(rel_id)
-
-        # Step 3: Find related entities that ALSO have message connections
-        # This ensures no disconnected entity nodes in the graph
-        if include_related_entities and mentioned_entity_ids:
-            # Get related entities that have at least one message mentioning them
-            related_query = """
-            UNWIND $entity_ids AS eid
-            MATCH (e:Entity {id: eid})
-            OPTIONAL MATCH (e)-[r:RELATED_TO]-(related:Entity)
-            WHERE related IS NOT NULL
-            // Only include related entities that have message connections
-            AND EXISTS { (related)<-[:MENTIONS]-(:Message) }
-            WITH e, related, r,
-                 CASE WHEN startNode(r) = e THEN 'outgoing' ELSE 'incoming' END AS direction
-            ORDER BY related.name
-            WITH e, collect({
-                entity: related,
-                direction: direction
-            })[0..$max_related] AS related_list
-            RETURN e.id AS source_id, related_list
-            """
-
-            related_results = await ctx.deps.client._client.execute_read(
-                related_query,
-                {
-                    "entity_ids": mentioned_entity_ids,
-                    "max_related": max_related_per_entity,
-                },
-            )
-
-            # Track which related entities we add so we can fetch their messages
-            new_related_entity_ids: list[str] = []
-
-            # Add related entities and relationships
-            for row in related_results:
-                source_id = row["source_id"]
-                source_node_id = f"entity-{source_id}"
-
-                for rel_info in row.get("related_list", []):
-                    if not rel_info:
-                        continue
-                    related_entity = rel_info.get("entity")
-                    if not related_entity or not related_entity.get("id"):
-                        continue
-
-                    related_id = f"entity-{related_entity['id']}"
-                    raw_related_id = related_entity["id"]
-
-                    # Add related entity node if not seen
-                    if related_id not in seen_node_ids:
+                    if entity_id not in seen_node_ids:
+                        metadata = getattr(entity, "metadata", {}) or {}
+                        enriched_desc = getattr(entity, "enriched_description", None) or metadata.get(
+                            "enriched_description"
+                        )
                         nodes.append(
                             {
-                                "id": related_id,
-                                "label": related_entity.get("name", "Unknown"),
-                                "type": related_entity.get("type", "Entity"),
+                                "id": entity_id,
+                                "label": entity.name,
+                                "type": entity.type or "Entity",
                                 "properties": {
-                                    "subtype": related_entity.get("subtype"),
-                                    "enriched_description": related_entity.get(
-                                        "enriched_description"
-                                    ),
+                                    "subtype": entity.subtype,
+                                    "enriched_description": enriched_desc,
                                 },
                             }
                         )
-                        seen_node_ids.add(related_id)
-                        new_related_entity_ids.append(raw_related_id)
+                        seen_node_ids.add(entity_id)
+                        mentioned_entity_ids.append(raw_entity_id)
 
-                    # Add RELATED_TO relationship (normalize direction)
-                    if rel_info.get("direction") == "outgoing":
-                        rel_from, rel_to = source_node_id, related_id
-                    else:
-                        rel_from, rel_to = related_id, source_node_id
-
-                    rel_id = f"related-{rel_from}-{rel_to}"
-                    reverse_rel_id = f"related-{rel_to}-{rel_from}"
-
-                    if rel_id not in seen_rel_ids and reverse_rel_id not in seen_rel_ids:
+                    # Add MENTIONS relationship
+                    rel_id = f"mentions-{msg_node_id}-{entity_id}"
+                    if rel_id not in seen_rel_ids:
                         relationships.append(
                             {
                                 "id": rel_id,
-                                "from": rel_from,
-                                "to": rel_to,
-                                "type": "RELATED_TO",
-                                "properties": {},
+                                "from": msg_node_id,
+                                "to": entity_id,
+                                "type": "MENTIONS",
                             }
                         )
                         seen_rel_ids.add(rel_id)
+            except Exception:
+                pass  # Skip messages where entity lookup fails
 
-        # Step 4: Find any RELATED_TO relationships between all entities in our set
-        all_entity_ids = [n["id"].replace("entity-", "") for n in nodes if n["type"] != "Message"]
-        if len(all_entity_ids) > 1:
-            inter_rel_query = """
-            MATCH (e1:Entity)-[r:RELATED_TO]->(e2:Entity)
-            WHERE e1.id IN $entity_ids AND e2.id IN $entity_ids
-            RETURN e1.id AS from_id, e2.id AS to_id
-            """
-            inter_results = await ctx.deps.client._client.execute_read(
-                inter_rel_query, {"entity_ids": all_entity_ids}
-            )
-
-            for rel in inter_results:
-                rel_from = f"entity-{rel['from_id']}"
-                rel_to = f"entity-{rel['to_id']}"
-                rel_id = f"related-{rel_from}-{rel_to}"
-                reverse_rel_id = f"related-{rel_to}-{rel_from}"
-
-                if rel_id not in seen_rel_ids and reverse_rel_id not in seen_rel_ids:
-                    relationships.append(
-                        {
-                            "id": rel_id,
-                            "from": rel_from,
-                            "to": rel_to,
-                            "type": "RELATED_TO",
-                            "properties": {},
-                        }
+        # Step 3: Find related entities via traverse
+        if include_related_entities and mentioned_entity_ids:
+            for raw_eid in mentioned_entity_ids[:10]:  # Limit to avoid too many traversals
+                try:
+                    related_nodes = await graph.traverse(
+                        "Entity",
+                        raw_eid,
+                        relationship_types=["RELATED_TO"],
+                        direction="both",
+                        target_labels=["Entity"],
+                        include_edges=True,
+                        limit=max_related_per_entity,
                     )
-                    seen_rel_ids.add(rel_id)
 
-        # Step 5: Find additional messages that mention any of the entities in our graph
-        # This shows messages connected to entities (beyond the original vector search results)
-        if all_entity_ids:
-            # Get up to 2 messages per entity (to avoid explosion but ensure connectivity)
-            messages_for_entities_query = """
-            UNWIND $entity_ids AS eid
-            MATCH (e:Entity {id: eid})<-[mentions:MENTIONS]-(m:Message)
-            WHERE NOT m.id IN $existing_message_ids
-            WITH e, m, mentions
-            ORDER BY mentions.confidence DESC
-            WITH e, collect({
-                message_id: m.id,
-                content: m.content,
-                metadata: m.metadata
-            })[0..2] AS messages
-            RETURN e.id AS entity_id, messages
-            """
+                    source_node_id = f"entity-{raw_eid}"
+                    for related_row in related_nodes:
+                        edge_data = related_row.get("_edge", {})
+                        entity_data = {k: v for k, v in related_row.items() if k != "_edge"}
+                        related_raw_id = entity_data.get("id")
+                        if not related_raw_id:
+                            continue
 
-            # Get existing message IDs (strip the "msg-" prefix)
-            existing_msg_ids = [
-                n["id"].replace("msg-", "") for n in nodes if n["type"] == "Message"
-            ]
+                        related_id = f"entity-{related_raw_id}"
 
-            msg_results = await ctx.deps.client._client.execute_read(
-                messages_for_entities_query,
-                {
-                    "entity_ids": all_entity_ids,
-                    "existing_message_ids": existing_msg_ids,
-                },
-            )
+                        if related_id not in seen_node_ids:
+                            rel_metadata = entity_data.get("metadata", {})
+                            if isinstance(rel_metadata, str):
+                                try:
+                                    rel_metadata = json.loads(rel_metadata)
+                                except (json.JSONDecodeError, TypeError):
+                                    rel_metadata = {}
+                            enriched_desc = entity_data.get("enriched_description") or rel_metadata.get(
+                                "enriched_description"
+                            )
+                            nodes.append(
+                                {
+                                    "id": related_id,
+                                    "label": entity_data.get("name", "Unknown"),
+                                    "type": entity_data.get("type", "Entity"),
+                                    "properties": {
+                                        "subtype": entity_data.get("subtype"),
+                                        "enriched_description": enriched_desc,
+                                    },
+                                }
+                            )
+                            seen_node_ids.add(related_id)
 
-            for row in msg_results:
-                entity_id = f"entity-{row['entity_id']}"
+                        # Add RELATED_TO relationship
+                        rel_id = f"related-{source_node_id}-{related_id}"
+                        reverse_rel_id = f"related-{related_id}-{source_node_id}"
+                        if rel_id not in seen_rel_ids and reverse_rel_id not in seen_rel_ids:
+                            relationships.append(
+                                {
+                                    "id": rel_id,
+                                    "from": source_node_id,
+                                    "to": related_id,
+                                    "type": "RELATED_TO",
+                                    "properties": {},
+                                }
+                            )
+                            seen_rel_ids.add(rel_id)
+                except Exception:
+                    pass  # Skip entities where traversal fails
 
-                for msg_info in row.get("messages", []):
-                    if not msg_info or not msg_info.get("message_id"):
+        # Step 4: Find additional messages for entities via traverse
+        all_entity_ids = [n["id"].replace("entity-", "") for n in nodes if n["type"] != "Message"]
+        existing_msg_ids = {n["id"].replace("msg-", "") for n in nodes if n["type"] == "Message"}
+
+        for raw_eid in all_entity_ids[:15]:  # Limit traversals
+            try:
+                msg_nodes = await graph.traverse(
+                    "Entity",
+                    raw_eid,
+                    relationship_types=["MENTIONS"],
+                    direction="incoming",
+                    target_labels=["Message"],
+                    limit=2,
+                )
+                entity_id = f"entity-{raw_eid}"
+
+                for msg_row in msg_nodes:
+                    msg_raw_id = msg_row.get("id", "")
+                    if msg_raw_id in existing_msg_ids:
                         continue
 
-                    msg_id = f"msg-{msg_info['message_id']}"
-
-                    # Add message node if not seen
+                    msg_id = f"msg-{msg_raw_id}"
                     if msg_id not in seen_node_ids:
-                        # Parse metadata
-                        metadata = {}
-                        if msg_info.get("metadata"):
+                        metadata = msg_row.get("metadata", {})
+                        if isinstance(metadata, str):
                             try:
-                                metadata = json.loads(msg_info["metadata"])
+                                metadata = json.loads(metadata)
                             except (json.JSONDecodeError, TypeError):
                                 metadata = {}
 
-                        content = msg_info.get("content", "")
+                        content = msg_row.get("content", "")
                         if len(content) > 300:
                             content = content[:300] + "..."
 
@@ -2302,13 +2058,14 @@ async def memory_graph_search(
                                     "content": content,
                                     "speaker": metadata.get("speaker"),
                                     "episode": metadata.get("episode_guest"),
-                                    "source": "entity_connection",  # Mark as found via entity
+                                    "source": "entity_connection",
                                 },
                             }
                         )
                         seen_node_ids.add(msg_id)
+                        existing_msg_ids.add(msg_raw_id)
 
-                    # Add MENTIONS relationship from message to entity
+                    # Add MENTIONS relationship
                     rel_id = f"mentions-{msg_id}-{entity_id}"
                     if rel_id not in seen_rel_ids:
                         relationships.append(
@@ -2320,15 +2077,15 @@ async def memory_graph_search(
                             }
                         )
                         seen_rel_ids.add(rel_id)
+            except Exception:
+                pass
 
-        # Step 6: Remove any disconnected nodes (entities with no relationships)
-        # Build set of all node IDs that have at least one relationship
+        # Step 5: Remove disconnected nodes
         connected_node_ids: set[str] = set()
         for rel in relationships:
             connected_node_ids.add(rel["from"])
             connected_node_ids.add(rel["to"])
 
-        # Filter nodes to only include connected ones
         nodes = [n for n in nodes if n["id"] in connected_node_ids]
 
         return {
