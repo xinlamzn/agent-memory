@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Export and import extracted entities for Lenny's Podcast data.
+"""Export and import the full entity graph for Lenny's Podcast data.
 
-Entities are exported in a message-centric JSON format keyed by session_id
-and turn_index (stable identifiers that don't depend on graph node IDs).
-This allows entities to be loaded into a fresh database without re-running
-the NER extraction pipeline.
+Exports entities, MENTIONS edges, RELATED_TO relationship edges, and all
+enrichment data (Wikipedia descriptions, geocoding, etc.) in a portable
+JSON format keyed by session_id and turn_index.
 
-Export: reads Entity nodes + MENTIONS edges from the graph, resolves each
-        entity back to its source message via (session_id, turn_index).
-Import: reads the JSON, finds messages by session_id + turn_index, and
-        recreates Entity nodes + MENTIONS/EXTRACTED_FROM edges.
+This allows the complete entity graph — including backfilled relationships
+and enrichment — to be restored into a fresh database without re-running
+the NER extraction, relationship backfill, or enrichment pipelines.
+
+Format version 2 adds:
+  - Full entity properties (enrichment, geocoding, etc.)
+  - RELATED_TO edges keyed by entity name (stable across re-imports)
 
 Usage:
-    # Export entities to JSON
+    # Export full graph to JSON
     python manage_entities.py export entities.json
 
-    # Import entities from JSON
+    # Import full graph from JSON
     python manage_entities.py import entities.json
 
     # Dry-run import (show what would be created)
@@ -176,6 +178,7 @@ def export_entities(args):
     print(f"{len(msg_info)} messages with turn_index")
 
     # Step 4: Fetch all Entity nodes → {node_id: entity_data}
+    # Include full properties so enrichment/geocoding data is preserved.
     print("  Fetching entities...", end=" ", flush=True)
     entity_docs = _scroll_all(
         endpoint, "memory-lpg-nodes",
@@ -184,17 +187,14 @@ def export_entities(args):
         username=username, password=password, verify_ssl=verify_ssl,
     )
     entity_map = {}  # node_id → entity_data
+    # Properties to export (skip large/internal fields)
+    _SKIP_PROPS = {"id", "embedding", "task_embedding"}
     for doc in entity_docs:
         src = doc["_source"]
         props = src["properties"]
-        entity_map[src["id"]] = {
-            "name": props.get("name"),
-            "type": props.get("type"),
-            "subtype": props.get("subtype"),
-            "canonical_name": props.get("canonical_name"),
-            "confidence": props.get("confidence"),
-            "labels": src.get("labels", []),
-        }
+        entity_data = {k: v for k, v in props.items() if k not in _SKIP_PROPS and v is not None}
+        entity_data["labels"] = src.get("labels", [])
+        entity_map[src["id"]] = entity_data
     print(f"{len(entity_map)} entities")
 
     # Step 5: Fetch all MENTIONS edges → message_node_id → [(entity_node_id, props)]
@@ -207,7 +207,37 @@ def export_entities(args):
     )
     print(f"{len(mentions_docs)} edges")
 
-    # Step 6: Assemble into export format
+    # Step 6: Fetch all RELATED_TO edges → relationships between entities
+    print("  Fetching RELATED_TO edges...", end=" ", flush=True)
+    rel_docs = _scroll_all(
+        endpoint, "memory-lpg-edges",
+        {"term": {"type": "RELATED_TO"}},
+        fields=["source", "target", "properties"],
+        username=username, password=password, verify_ssl=verify_ssl,
+    )
+    # Resolve to entity names for portability across re-imports
+    relationships = []
+    rel_skipped = 0
+    for doc in rel_docs:
+        src = doc["_source"]
+        source_entity = entity_map.get(src["source"])
+        target_entity = entity_map.get(src["target"])
+        if not source_entity or not target_entity:
+            rel_skipped += 1
+            continue
+        rel_props = src.get("properties", {})
+        relationships.append({
+            "source_name": source_entity["name"],
+            "source_type": source_entity.get("type"),
+            "target_name": target_entity["name"],
+            "target_type": target_entity.get("type"),
+            "relation_type": rel_props.get("relation_type"),
+            "confidence": rel_props.get("confidence"),
+            "created_at": rel_props.get("created_at"),
+        })
+    print(f"{len(rel_docs)} edges ({len(relationships)} resolved, {rel_skipped} skipped)")
+
+    # Step 7: Assemble into export format
     print("  Assembling export data...", end=" ", flush=True)
     sessions: dict[str, dict[int, list[dict]]] = {}
     skipped = 0
@@ -238,19 +268,12 @@ def export_entities(args):
             skipped += 1
             continue
 
-        # Build entry
-        entry = {
-            "name": entity_data["name"],
-            "type": entity_data["type"],
-            "subtype": entity_data["subtype"],
-            "canonical_name": entity_data["canonical_name"],
-            "confidence": entity_data["confidence"],
-            "labels": entity_data["labels"],
-            "mention": {
-                "confidence": mention_props.get("confidence"),
-                "start_pos": mention_props.get("start_pos"),
-                "end_pos": mention_props.get("end_pos"),
-            },
+        # Build entry — include all entity properties for full restore
+        entry = dict(entity_data)
+        entry["mention"] = {
+            "confidence": mention_props.get("confidence"),
+            "start_pos": mention_props.get("start_pos"),
+            "end_pos": mention_props.get("end_pos"),
         }
 
         if session_id not in sessions:
@@ -261,7 +284,7 @@ def export_entities(args):
 
     # Convert turn_index keys to sorted lists for cleaner JSON
     export_data = {
-        "version": 1,
+        "version": 2,
         "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "stats": {
             "sessions": len(sessions),
@@ -269,6 +292,8 @@ def export_entities(args):
             "total_mentions": len(mentions_docs),
             "unique_entities": len(entity_map),
             "skipped_mentions": skipped,
+            "relationships": len(relationships),
+            "skipped_relationships": rel_skipped,
         },
         "sessions": {},
     }
@@ -282,6 +307,8 @@ def export_entities(args):
                 "entities": turns[turn_index],
             })
 
+    export_data["relationships"] = relationships
+
     # Write JSON
     output_path = Path(args.output_file)
     output_path.write_text(json.dumps(export_data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -293,8 +320,11 @@ def export_entities(args):
     print(f"  Messages with entities: {export_data['stats']['messages_with_entities']}")
     print(f"  Total mentions: {export_data['stats']['total_mentions']}")
     print(f"  Unique entities: {export_data['stats']['unique_entities']}")
+    print(f"  Relationships: {export_data['stats']['relationships']}")
     if skipped:
-        print(f"  Skipped (unresolved): {skipped}")
+        print(f"  Skipped mentions: {skipped}")
+    if rel_skipped:
+        print(f"  Skipped relationships: {rel_skipped}")
     print(f"  Output: {output_path}")
     print(f"  Elapsed: {elapsed:.1f}s")
 
@@ -325,13 +355,17 @@ def import_entities(args):
     data = json.loads(input_path.read_text(encoding="utf-8"))
 
     version = data.get("version", 1)
-    if version != 1:
+    if version not in (1, 2):
         print(f"Warning: Unknown format version {version}, attempting import anyway")
 
     stats = data.get("stats", {})
     sessions = data.get("sessions", {})
+    relationships = data.get("relationships", [])
+    print(f"  Version: {version}")
     print(f"  Sessions: {len(sessions)}")
     print(f"  Total mentions: {stats.get('total_mentions', 'unknown')}")
+    if relationships:
+        print(f"  Relationships: {len(relationships)}")
 
     if args.dry_run:
         print("\nDry run — showing summary per session:")
@@ -341,6 +375,15 @@ def import_entities(args):
             print(f"  {session_id}: {len(turns)} messages, {total_entities} entities")
         total = sum(sum(len(t["entities"]) for t in turns) for turns in sessions.values())
         print(f"\nTotal: {total} entity mentions across {len(sessions)} sessions")
+        if relationships:
+            # Summarise relationship types
+            type_counts: dict[str, int] = {}
+            for rel in relationships:
+                rt = rel.get("relation_type", "UNKNOWN")
+                type_counts[rt] = type_counts.get(rt, 0) + 1
+            print(f"\nRelationships: {len(relationships)} total")
+            for rt, count in sorted(type_counts.items(), key=lambda x: -x[1]):
+                print(f"  {rt}: {count}")
         return
 
     # Build MemoryClient settings
@@ -370,6 +413,9 @@ def import_entities(args):
             total_created = 0
             total_linked = 0
             total_skipped = 0
+            total_rels_created = 0
+            total_rels_skipped = 0
+            name_to_ids: dict[tuple[str, str | None], list[str]] = {}
             start_time = time.time()
 
             for sess_idx, session_id in enumerate(sorted(sessions), 1):
@@ -435,24 +481,30 @@ def import_entities(args):
                         if entity.get("subtype"):
                             additional_labels.append(entity["subtype"])
 
+                        # Build properties — restore all exported fields
+                        # v2 exports all entity properties directly; v1 has just name/type/subtype
+                        _IMPORT_SKIP = {"labels", "mention"}
+                        props = {k: v for k, v in entity.items() if k not in _IMPORT_SKIP and v is not None}
+                        # Ensure minimum required fields
+                        props.setdefault("name", entity.get("name", ""))
+                        props.setdefault("canonical_name", entity.get("name", ""))
+
                         # Create Entity node
                         await client.upsert_node(
                             "Entity",
                             id=entity_id,
-                            properties={
-                                "name": entity["name"],
-                                "type": entity.get("type"),
-                                "subtype": entity.get("subtype"),
-                                "canonical_name": entity.get("canonical_name", entity["name"]),
-                                "description": None,
-                                "embedding": None,
-                                "confidence": entity.get("confidence", 0.85),
-                                "metadata": None,
-                                "location": None,
-                            },
+                            properties=props,
                             additional_labels=additional_labels if additional_labels else None,
                         )
                         total_created += 1
+
+                        # Track name → id for relationship recreation
+                        ent_name = entity.get("name", "")
+                        ent_type = entity.get("type")
+                        name_key = (ent_name, ent_type)
+                        if name_key not in name_to_ids:
+                            name_to_ids[name_key] = []
+                        name_to_ids[name_key].append(entity_id)
 
                         mention = entity.get("mention", {})
                         link_props = {
@@ -490,13 +542,54 @@ def import_entities(args):
                 )
                 total_skipped += session_skipped
 
+            # Recreate RELATED_TO edges from the relationships section
+            if relationships:
+                print(f"\n  Importing {len(relationships)} relationships...")
+                for rel_idx, rel in enumerate(relationships, 1):
+                    src_key = (rel["source_name"], rel.get("source_type"))
+                    tgt_key = (rel["target_name"], rel.get("target_type"))
+                    src_ids = name_to_ids.get(src_key, [])
+                    tgt_ids = name_to_ids.get(tgt_key, [])
+
+                    if not src_ids or not tgt_ids:
+                        total_rels_skipped += 1
+                        continue
+
+                    # Link the first matching entity pair
+                    rel_props = {}
+                    if rel.get("relation_type"):
+                        rel_props["relation_type"] = rel["relation_type"]
+                    if rel.get("confidence") is not None:
+                        rel_props["confidence"] = rel["confidence"]
+                    if rel.get("created_at"):
+                        rel_props["created_at"] = rel["created_at"]
+
+                    await client.link_nodes(
+                        "Entity", src_ids[0],
+                        "Entity", tgt_ids[0],
+                        "RELATED_TO",
+                        properties=rel_props,
+                    )
+                    total_rels_created += 1
+
+                    if rel_idx % 50 == 0 or rel_idx == len(relationships):
+                        print(
+                            f"\r    Relationships: {rel_idx}/{len(relationships)}"
+                            f" ({total_rels_created} created, {total_rels_skipped} skipped)\033[K",
+                            end="", flush=True,
+                        )
+                print()
+
             elapsed = time.time() - start_time
             print()
-            print()
             print(f"  Entities created: {total_created}")
-            print(f"  Edges created: {total_linked * 2} (MENTIONS + EXTRACTED_FROM)")
+            print(f"  Mention edges created: {total_linked * 2} (MENTIONS + EXTRACTED_FROM)")
+            if total_rels_created:
+                print(f"  Relationship edges created: {total_rels_created}")
             if total_skipped:
-                print(f"  Skipped: {total_skipped}")
+                print(f"  Skipped entities: {total_skipped}")
+            if total_rels_skipped:
+                print(f"  Skipped relationships: {total_rels_skipped}")
             print(f"  Elapsed: {elapsed:.1f}s")
 
     asyncio.run(_import())
